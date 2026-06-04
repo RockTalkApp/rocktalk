@@ -183,6 +183,7 @@ export default function RockTalk() {
   const messagesEndRef = useRef(null);
   const botTimerRef = useRef(null);
   const channelRef = useRef(null);
+  const heartbeatRef = useRef(null);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
   useEffect(() => { const t = setInterval(() => setTick(n => n + 1), 1000); return () => clearInterval(t); }, []);
@@ -294,6 +295,28 @@ export default function RockTalk() {
       });
     channelRef.current = channel;
 
+    // Heartbeat — update last_seen every 30 seconds so cleanup knows we're alive
+    clearInterval(heartbeatRef.current);
+    heartbeatRef.current = setInterval(async () => {
+      await supabase.from("users").update({ last_seen: new Date().toISOString() }).eq("session_id", SESSION_ID);
+    }, 30000);
+
+    // Cleanup stale users every 60 seconds
+    const runCleanup = async () => {
+      await supabase.rpc("cleanup_stale_users");
+      // Refresh room rocks after cleanup
+      const { data: freshUsers } = await supabase.from("users").select("*").eq("current_room", rn).neq("session_id", SESSION_ID);
+      if (freshUsers) {
+        setRoomRocks(prev => {
+          const bots = prev.filter(r => r.isBot);
+          const humans = freshUsers.map(u => ({ id: u.session_id, name: u.user_name, color: u.rock_color, shapeIndex: u.rock_shape, accessory: u.rock_accessory, isBot: false }));
+          const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
+          return [...humans, ...bots.slice(0, botCount)];
+        });
+      }
+    };
+    setTimeout(runCleanup, 60000);
+
     // Bot chat timer — only fires if no other humans in room
     botTimerRef.current = setInterval(() => {
       setRoomRocks(prev => {
@@ -316,6 +339,7 @@ export default function RockTalk() {
 
   const leaveRoom = async () => {
     clearInterval(botTimerRef.current);
+    clearInterval(heartbeatRef.current);
     const currentRoom = roomNumber;
 
     if (channelRef.current) {
@@ -360,7 +384,12 @@ export default function RockTalk() {
   // Cleanup on tab close
   useEffect(() => {
     const cleanup = async () => {
-      await supabase.from("users").update({ current_room: null }).eq("session_id", SESSION_ID);
+      clearInterval(heartbeatRef.current);
+      await supabase.from("users").update({ current_room: null, last_seen: new Date().toISOString() }).eq("session_id", SESSION_ID);
+      if (roomNumber) {
+        const { data: room } = await supabase.from("rooms").select("*").eq("room_number", roomNumber).single();
+        if (room) await supabase.from("rooms").update({ human_count: Math.max(0, room.human_count - 1) }).eq("id", room.id);
+      }
     };
     window.addEventListener("beforeunload", cleanup);
     return () => { window.removeEventListener("beforeunload", cleanup); cleanup(); };
