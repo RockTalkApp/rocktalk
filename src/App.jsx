@@ -1,20 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from "react";
+import { createClient } from "@supabase/supabase-js";
 
-// ─── Google Analytics ────────────────────────────────────────────────────────
-const GA_ID = 'G-7D0PRRDFGN';
-if (typeof window !== 'undefined') {
-  const script1 = document.createElement('script');
-  script1.async = true;
-  script1.src = `https://www.googletagmanager.com/gtag/js?id=${GA_ID}`;
-  document.head.appendChild(script1);
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){window.dataLayer.push(arguments);}
-  window.gtag = gtag;
-  gtag('js', new Date());
-  gtag('config', GA_ID);
-}
-
-
+// ─── Supabase ─────────────────────────────────────────────────────────────────
+const SUPABASE_URL = "https://kqhdlhgghbeqsohbhboa.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImtxaGRsaGdnaGJlcXNvaGJoYm9hIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODA1Mzk5NzAsImV4cCI6MjA5NjExNTk3MH0._Zb8kMbw78F4aGWJ6wC7-Kqd9TG_L4LBD9DEmPRCiys";
+const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
 // ─── Rock SVG renderer ───────────────────────────────────────────────────────
 const ROCK_SHAPES = [
@@ -97,13 +87,6 @@ const BOT_LINES = [
   "silently judging everyone","vibing in the mineral kingdom",
 ];
 
-// Simulated human names for the "simulate human joining" demo button
-const FAKE_HUMAN_NAMES = [
-  "GneissToMeetYou","mineral_mike","just_a_rock","RockLobster99",
-  "quartzite_queen","pebble.exe","TheLavaLamp","BasaltBabe",
-];
-const FAKE_HUMAN_COLORS = ["#a06040","#4a8a70","#7060a0","#4080a0","#a07040","#608060"];
-
 function makeBot(id) {
   return {
     id: `bot_${id}`, name: BOT_NAMES[id % BOT_NAMES.length],
@@ -113,30 +96,44 @@ function makeBot(id) {
   };
 }
 
-function makeFakeHuman(seed) {
-  return {
-    id: `human_${seed}_${Date.now()}`,
-    name: FAKE_HUMAN_NAMES[seed % FAKE_HUMAN_NAMES.length],
-    color: FAKE_HUMAN_COLORS[seed % FAKE_HUMAN_COLORS.length],
-    shapeIndex: (seed + 2) % 4,
-    accessory: Object.keys(ACCESSORIES)[(seed + 1) % Object.keys(ACCESSORIES).length],
-    isBot: false,
-  };
+// ─── Moderation ───────────────────────────────────────────────────────────────
+
+// Hard blocklist — these are caught instantly, no AI call needed
+const HARD_BLOCKED = [
+  "nigger","nigga","nigg","n1gger","n1gga",
+  "faggot","fag","tranny","chink","spic","kike","gook","wetback","coon",
+  "kill yourself","kys","kill ur self","end yourself","go kill",
+  "lynch","hang yourself","rape","rapist",
+  "retard","retarded",
+];
+
+function hardBlock(text) {
+  const lower = text.toLowerCase().replace(/[^a-z0-9\s]/g, "");
+  for (const word of HARD_BLOCKED) {
+    if (lower.includes(word)) {
+      return { allowed: false, reason: "that language isn't allowed here — keep it rock-friendly 🪨" };
+    }
+  }
+  return null;
 }
 
-// ─── Claude API helpers ───────────────────────────────────────────────────────
-async function checkUsername(name) {
+async function checkContent(text, type = "message") {
+  // Hard blocklist first — instant, no API call
+  const hardResult = hardBlock(text);
+  if (hardResult) return hardResult;
+
+  // Then AI moderation for subtler cases
   try {
     const res = await fetch("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: "claude-sonnet-4-20250514", max_tokens: 1000,
-        system: `You are a username moderator for Rock Talk, a fun family-friendly app.
-Reject usernames with: profanity, slurs, hate speech, sexual content, violence, or anything unwelcoming.
-Allow: rock puns, creative names, mild silliness, numbers, underscores, normal names.
-Respond ONLY with valid JSON, nothing else: {"allowed":true} or {"allowed":false,"reason":"brief friendly reason"}`,
-        messages: [{ role: "user", content: `Check this username: "${name}"` }],
+        system: `You are a ${type} moderator for Rock Talk, a fun family-friendly app.
+Reject content with: racial slurs, hate speech, harassment, threats like "kill yourself", sexual content directed at people, or anything that targets someone's identity.
+Allow: rock puns, creative names, mild swearing, normal conversation, edgy humor that isn't targeting anyone.
+Respond ONLY with valid JSON: {"allowed":true} or {"allowed":false,"reason":"brief friendly reason"}`,
+        messages: [{ role: "user", content: `Check this ${type}: "${text}"` }],
       }),
     });
     const data = await res.json();
@@ -144,30 +141,29 @@ Respond ONLY with valid JSON, nothing else: {"allowed":true} or {"allowed":false
   } catch { return { allowed: true }; }
 }
 
-async function checkMessage(text) {
-  try {
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: "claude-sonnet-4-20250514", max_tokens: 1000,
-        system: `You are a chat moderator for Rock Talk, a fun family-friendly app where users chat as rocks.
-Reject messages with: profanity, slurs, hate speech, harassment, sexual content, threats, or anything that would make someone feel unsafe.
-Allow: rock puns, playful banter, normal conversation, mild silliness, questions, greetings.
-Be lenient — only block genuinely harmful content, not edgy humor.
-Respond ONLY with valid JSON, nothing else: {"allowed":true} or {"allowed":false,"reason":"brief friendly reason"}`,
-        messages: [{ role: "user", content: `Check this chat message: "${text}"` }],
-      }),
-    });
-    const data = await res.json();
-    return JSON.parse((data.content?.[0]?.text || '{"allowed":true}').replace(/```json|```/g,"").trim());
-  } catch { return { allowed: true }; }
+// ─── Session ID ───────────────────────────────────────────────────────────────
+function getSessionId() {
+  let id = sessionStorage.getItem("rock_session");
+  if (!id) { id = Math.random().toString(36).slice(2) + Date.now(); sessionStorage.setItem("rock_session", id); }
+  return id;
 }
 
 // ─── Constants ───────────────────────────────────────────────────────────────
 const COLORS = ["#8B7355","#6B8E6B","#8E6B7A","#6B7A8E","#8E8E6B","#7A6B8E","#6B8E8E","#8E7A6B"];
 const COLOR_NAMES = ["Sandstone","Mossy","Rose Quartz","Slate Blue","Citrine","Amethyst","Aquamarine","Amber"];
 const ROOM_CAPACITY = 6;
+const SESSION_ID = getSessionId();
+
+// ─── Google Analytics ─────────────────────────────────────────────────────────
+const GA_ID = "G-7D0PRRDFGN";
+if (typeof window !== "undefined") {
+  const s = document.createElement("script");
+  s.async = true; s.src = `https://www.googletagmanager.com/gtag/js?id=${GA_ID}`;
+  document.head.appendChild(s);
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){window.dataLayer.push(arguments);} window.gtag = gtag;
+  gtag("js", new Date()); gtag("config", GA_ID);
+}
 
 // ─── Main App ────────────────────────────────────────────────────────────────
 export default function RockTalk() {
@@ -177,62 +173,198 @@ export default function RockTalk() {
   const [messages, setMessages] = useState([]);
   const [input, setInput] = useState("");
   const [blockedMsg, setBlockedMsg] = useState("");
-  const [roomId, setRoomId] = useState(1);
+  const [roomNumber, setRoomNumber] = useState(null);
   const [roomRocks, setRoomRocks] = useState([]);
   const [speakingId, setSpeakingId] = useState(null);
   const [wiggleId, setWiggleId] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
   const [isSending, setIsSending] = useState(false);
+  const [tick, setTick] = useState(0);
   const messagesEndRef = useRef(null);
   const botTimerRef = useRef(null);
+  const channelRef = useRef(null);
 
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages]);
+  useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
+  useEffect(() => { const t = setInterval(() => setTick(n => n + 1), 1000); return () => clearInterval(t); }, []);
+  useEffect(() => { if (!blockedMsg) return; const t = setTimeout(() => setBlockedMsg(""), 3000); return () => clearTimeout(t); }, [blockedMsg]);
 
-  // Clear blocked message after 3s
-  useEffect(() => {
-    if (!blockedMsg) return;
-    const t = setTimeout(() => setBlockedMsg(""), 3000);
-    return () => clearTimeout(t);
-  }, [blockedMsg]);
-
-  const enterRoom = useCallback((id) => {
+  // ── Join a room ──────────────────────────────────────────────────────────
+  const joinRoom = useCallback(async (rock, name, forcedRoom = null) => {
     clearInterval(botTimerRef.current);
-    setRoomId(id);
-    const botCount = Math.min(ROOM_CAPACITY - 1, 3 + Math.floor(Math.random() * 2));
-    const bots = Array.from({ length: botCount }, (_, i) => makeBot((id * 10 + i) % BOT_NAMES.length));
-    setRoomRocks(bots);
-    setMessages([{
-      id: Date.now(), rockId: "system",
-      text: `You rolled into Room #${id}. ${botCount} bots here — they'll stay until real rocks join.`,
-      system: true,
-    }]);
+    if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
 
-    // Bots chat occasionally — they never leave on their own
+    let rn;
+    if (forcedRoom) {
+      rn = forcedRoom;
+      setRoomNumber(rn);
+    } else {
+      // Use atomic database function to avoid race conditions
+      const { data: rnData, error: rnError } = await supabase.rpc("join_or_create_room");
+      if (rnError) { console.error("Room join error:", rnError); return; }
+      rn = rnData;
+      setRoomNumber(rn);
+    }
+
+    // Write self to users table
+    await supabase.from("users").upsert({
+      session_id: SESSION_ID, user_name: name,
+      rock_color: rock.color, rock_shape: rock.shapeIndex,
+      rock_accessory: rock.accessory, current_room: rn,
+    }, { onConflict: "session_id" });
+
+    // Load existing users in room
+    const { data: existingUsers } = await supabase.from("users").select("*").eq("current_room", rn).neq("session_id", SESSION_ID);
+    const humanRocks = (existingUsers || []).map(u => ({
+      id: u.session_id, name: u.user_name, color: u.rock_color,
+      shapeIndex: u.rock_shape, accessory: u.rock_accessory, isBot: false,
+    }));
+
+    // Fill remaining slots with bots
+    const humanCount = humanRocks.length + 1;
+    const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humanCount - 1));
+    const bots = Array.from({ length: botCount }, (_, i) => makeBot((rn * 10 + i) % BOT_NAMES.length));
+    setRoomRocks([...humanRocks, ...bots]);
+
+    // Fresh start — no chat history shown on join
+    setMessages([
+      { id: "sys_join", rockId: "system", text: `You rolled into Room #${rn}. ${humanCount > 1 ? `${humanCount - 1} other rock${humanCount > 2 ? "s are" : " is"} here!` : "Bots are keeping you company..."}`, system: true },
+    ]);
+
+    // Subscribe to realtime via broadcast channel
+    const channel = supabase.channel(`room_${rn}`, { config: { broadcast: { self: false } } })
+      .on("broadcast", { event: "message" }, ({ payload }) => {
+        if (payload.session_id === SESSION_ID) return;
+        setMessages(prev => [...prev, { id: payload.id, rockId: payload.session_id, rockName: payload.user_name, text: payload.text, isBot: false, timestamp: Date.now() }]);
+        setSpeakingId(payload.session_id);
+        setTimeout(() => setSpeakingId(null), 2500);
+        // Add rock to scene if not already there
+        setRoomRocks(prev => {
+          if (prev.find(r => r.id === payload.session_id)) return prev;
+          const bots = prev.filter(r => r.isBot);
+          const newRock = { id: payload.session_id, name: payload.user_name, color: payload.rock_color || COLORS[0], shapeIndex: payload.rock_shape || 0, accessory: payload.rock_accessory || "none", isBot: false };
+          if (bots.length > 0) return [...prev.filter((r, i) => !r.isBot || i !== prev.findIndex(x => x.isBot)), newRock];
+          return [...prev, newRock];
+        });
+      })
+      .on("broadcast", { event: "ping" }, ({ payload }) => {
+        // New joiner requesting everyone to announce themselves
+        if (payload.session_id !== SESSION_ID && channelRef.current) {
+          setTimeout(() => {
+            channelRef.current.send({ type: "broadcast", event: "presence", payload: { type: "join", session_id: SESSION_ID, user_name: name, rock_color: rock.color, rock_shape: rock.shapeIndex, rock_accessory: rock.accessory } });
+          }, Math.random() * 300); // stagger responses so they dont all fire at once
+        }
+      })
+      .on("broadcast", { event: "presence" }, ({ payload }) => {
+        // Someone joined or left
+        if (payload.type === "join" && payload.session_id !== SESSION_ID) {
+          setMessages(prev => {
+            const alreadyAnnounced = prev.some(m => m.system && m.text && m.text.includes(payload.user_name) && m.text.includes("rolled in"));
+            if (alreadyAnnounced) return prev;
+            return [...prev, { id: Date.now(), rockId: "system", text: `${payload.user_name} just rolled in 🪨`, system: true }];
+          });
+          setRoomRocks(prev => {
+            if (prev.find(r => r.id === payload.session_id)) return prev;
+            const bots = prev.filter(r => r.isBot);
+            const newRock = { id: payload.session_id, name: payload.user_name, color: payload.rock_color || COLORS[0], shapeIndex: payload.rock_shape || 0, accessory: payload.rock_accessory || "none", isBot: false };
+            if (bots.length > 0) return [...prev.filter((r, i) => !r.isBot || i !== prev.findIndex(x => x.isBot)), newRock];
+            return [...prev, newRock];
+          });
+        } else if (payload.type === "leave" && payload.session_id !== SESSION_ID) {
+          setMessages(prev => [...prev, { id: Date.now(), rockId: "system", text: `${payload.user_name} rolled away`, system: true }]);
+          setRoomRocks(prev => {
+            const remaining = prev.filter(r => r.id !== payload.session_id);
+            const humanCount = remaining.filter(r => !r.isBot).length;
+            const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humanCount - 2));
+            const currentBots = remaining.filter(r => r.isBot);
+            const newBots = botCount > currentBots.length
+              ? [...currentBots, ...Array.from({ length: botCount - currentBots.length }, (_, i) => makeBot((rn * 10 + i + 50) % BOT_NAMES.length))]
+              : currentBots.slice(0, botCount);
+            return [...remaining.filter(r => !r.isBot), ...newBots];
+          });
+        }
+      })
+      .subscribe(async (status) => {
+        if (status === "SUBSCRIBED") {
+          // Ask everyone already in room to announce themselves
+          await channel.send({ type: "broadcast", event: "ping", payload: { session_id: SESSION_ID } });
+          // Then announce ourselves
+          await channel.send({ type: "broadcast", event: "presence", payload: { type: "join", session_id: SESSION_ID, user_name: name, rock_color: rock.color, rock_shape: rock.shapeIndex, rock_accessory: rock.accessory } });
+
+        }
+      });
+    channelRef.current = channel;
+
+    // Bot chat timer — only fires if no other humans in room
     botTimerRef.current = setInterval(() => {
       setRoomRocks(prev => {
-        if (!prev.length) return prev;
-        const bot = prev[Math.floor(Math.random() * prev.length)];
+        const humans = prev.filter(r => !r.isBot);
+        if (humans.length > 0) return prev; // real humans present — bots stay quiet
+        const bots = prev.filter(r => r.isBot);
+        if (!bots.length) return prev;
+        if (Math.random() > 0.2) return prev; // only 20% chance
+        const bot = bots[Math.floor(Math.random() * bots.length)];
         const line = BOT_LINES[Math.floor(Math.random() * BOT_LINES.length)];
         setSpeakingId(bot.id);
         setTimeout(() => setSpeakingId(null), 2500);
-        setMessages(m => [...m, { id: Date.now(), rockId: bot.id, rockName: bot.name, text: line }]);
+        setMessages(m => [...m, { id: Date.now(), rockId: bot.id, rockName: bot.name, text: line, timestamp: Date.now() }]);
         return prev;
       });
-    }, 7000 + Math.random() * 6000);
+    }, 8000);
+
+    return rn;
   }, []);
 
-  useEffect(() => {
-    if (screen === "room") enterRoom(roomId);
-    return () => clearInterval(botTimerRef.current);
-  }, [screen]);
-
-  const leaveRoom = () => {
+  const leaveRoom = async () => {
     clearInterval(botTimerRef.current);
-    const newId = Math.floor(Math.random() * 9999) + 1;
-    enterRoom(newId);
+    const currentRoom = roomNumber;
+
+    if (channelRef.current) {
+      await channelRef.current.send({ type: "broadcast", event: "presence", payload: { type: "leave", session_id: SESSION_ID, user_name: username } });
+      supabase.removeChannel(channelRef.current);
+      channelRef.current = null;
+    }
+
+    // Decrement old room count
+    if (currentRoom) {
+      const { data: room } = await supabase.from("rooms").select("*").eq("room_number", currentRoom).single();
+      if (room) await supabase.from("rooms").update({ human_count: Math.max(0, room.human_count - 1) }).eq("id", room.id);
+    }
+
+    await supabase.from("users").update({ current_room: null }).eq("session_id", SESSION_ID);
+
+    // Keep rolling until we land in a different room
+    let newRoomNumber = currentRoom;
+    let attempts = 0;
+    while (newRoomNumber === currentRoom && attempts < 5) {
+      const { data: rnData } = await supabase.rpc("join_or_create_room");
+      newRoomNumber = rnData;
+      attempts++;
+      // If same room, decrement and try again
+      if (newRoomNumber === currentRoom) {
+        const { data: room } = await supabase.from("rooms").select("*").eq("room_number", newRoomNumber).single();
+        if (room) await supabase.from("rooms").update({ human_count: Math.max(0, room.human_count - 1) }).eq("id", room.id);
+      }
+    }
+
+    // If still same room after retries, force create a new one
+    if (newRoomNumber === currentRoom) {
+      const freshNum = Math.floor(Math.random() * 9999) + 1;
+      await supabase.from("rooms").insert({ room_number: freshNum, human_count: 1 });
+      newRoomNumber = freshNum;
+    }
+
+    const myRockData = { color: myRock.color, shapeIndex: myRock.shapeIndex, accessory: myRock.accessory };
+    await joinRoom(myRockData, username, newRoomNumber);
   };
+
+  // Cleanup on tab close
+  useEffect(() => {
+    const cleanup = async () => {
+      await supabase.from("users").update({ current_room: null }).eq("session_id", SESSION_ID);
+    };
+    window.addEventListener("beforeunload", cleanup);
+    return () => { window.removeEventListener("beforeunload", cleanup); cleanup(); };
+  }, [roomNumber]);
 
   const sendMessage = async () => {
     if (!input.trim() || isSending) return;
@@ -241,49 +373,69 @@ export default function RockTalk() {
     setIsSending(true);
     setBlockedMsg("");
 
-    // Check message before sending
-    const check = await checkMessage(text);
+    const check = await checkContent(text, "message");
     setIsSending(false);
+    if (!check.allowed) { setBlockedMsg(`🚫 ${check.reason || "that message isn't allowed"}`); return; }
 
-    if (!check.allowed) {
-      setBlockedMsg(`🚫 ${check.reason || "that message isn't allowed"}`);
-      return;
-    }
-
-    setMessages(m => [...m, { id: Date.now(), rockId: "me", rockName: username, text }]);
+    // Show immediately locally
+    setMessages(m => [...m, { id: Date.now(), rockId: "me", rockName: username, text, timestamp: Date.now() }]);
     setSpeakingId("me");
     setTimeout(() => setSpeakingId(null), 2000);
 
-    // AI bot response
-    if (Math.random() > 0.35 && roomRocks.length > 0) {
-      setIsLoading(true);
-      const bot = roomRocks[Math.floor(Math.random() * roomRocks.length)];
-      try {
-        const res = await fetch("https://api.anthropic.com/v1/messages", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            model: "claude-sonnet-4-20250514", max_tokens: 1000,
-            system: `You are ${bot.name}, a rock in Rock Talk — a social app where users are rocks in random rooms. You cannot move, only talk. Dry wit, geological humor, existential musings. Under 20 words. Funny and charming.`,
-            messages: [{ role: "user", content: text }],
-          }),
-        });
-        const data = await res.json();
-        const reply = data.content?.[0]?.text;
-        if (reply) {
-          setTimeout(() => {
-            setSpeakingId(bot.id); setWiggleId(bot.id);
-            setTimeout(() => { setSpeakingId(null); setWiggleId(null); }, 2500);
-            setMessages(m => [...m, { id: Date.now(), rockId: bot.id, rockName: bot.name, text: reply }]);
-          }, 1200);
-        }
-      } catch (e) { console.error(e); }
-      finally { setIsLoading(false); }
+    // Broadcast to others in real time
+    if (channelRef.current) {
+      await channelRef.current.send({
+        type: "broadcast", event: "message",
+        payload: { id: Date.now(), session_id: SESSION_ID, user_name: username, text, rock_color: myRock.color, rock_shape: myRock.shapeIndex, rock_accessory: myRock.accessory },
+      });
+    }
+    // Also save to DB for history
+    await supabase.from("messages").insert({
+      room_number: roomNumber, session_id: SESSION_ID,
+      user_name: username, text,
+      rock_color: myRock.color, rock_shape: myRock.shapeIndex,
+      rock_accessory: myRock.accessory, is_bot: false,
+    });
+
+    // Bot AI response — only if no other humans in room, 20% chance
+    const humanRocks = roomRocks.filter(r => !r.isBot);
+    if (humanRocks.length === 0 && Math.random() < 0.2) {
+      const bots = roomRocks.filter(r => r.isBot);
+      if (bots.length > 0) {
+        setIsLoading(true);
+        const bot = bots[Math.floor(Math.random() * bots.length)];
+        try {
+          const res = await fetch("https://api.anthropic.com/v1/messages", {
+            method: "POST", headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              model: "claude-sonnet-4-20250514", max_tokens: 1000,
+              system: `You are ${bot.name}, a rock in Rock Talk. Dry wit, geological humor, under 20 words.`,
+              messages: [{ role: "user", content: text }],
+            }),
+          });
+          const data = await res.json();
+          const reply = data.content?.[0]?.text;
+          if (reply) {
+            setTimeout(() => {
+              setSpeakingId(bot.id); setWiggleId(bot.id);
+              setTimeout(() => { setSpeakingId(null); setWiggleId(null); }, 2500);
+              setMessages(m => [...m, { id: Date.now(), rockId: bot.id, rockName: bot.name, text: reply, timestamp: Date.now() }]);
+            }, 1200);
+          }
+        } catch (e) { console.error(e); }
+        finally { setIsLoading(false); }
+      }
     }
   };
 
   if (screen === "welcome") return <WelcomeScreen onNext={(name) => { setUsername(name); setScreen("customize"); }} />;
-  if (screen === "customize") return <CustomizeScreen username={username} rock={myRock} setRock={setMyRock} onEnter={() => setScreen("room")} />;
+  if (screen === "customize") return (
+    <CustomizeScreen username={username} rock={myRock} setRock={setMyRock}
+      onEnter={async () => {
+        setScreen("room");
+        await joinRoom(myRock, username);
+      }} />
+  );
 
   const myRockFull = { ...myRock, id: "me", name: username };
   const allRocks = [myRockFull, ...roomRocks];
@@ -291,10 +443,9 @@ export default function RockTalk() {
   return (
     <div style={styles.app}>
       <style>{globalStyles}</style>
-
       <div style={styles.header}>
         <span style={styles.logo}>🪨 rock talk</span>
-        <div style={styles.roomBadge}>Room #{roomId} · {allRocks.length}/{ROOM_CAPACITY}</div>
+        <div style={styles.roomBadge}>Room #{roomNumber} · {allRocks.length}/{ROOM_CAPACITY}</div>
         <button style={styles.leaveBtn} onClick={leaveRoom}>roll away →</button>
       </div>
 
@@ -304,16 +455,17 @@ export default function RockTalk() {
           const angle = (i / allRocks.length) * Math.PI * 2 - Math.PI / 2;
           const x = 50 + 36 * Math.cos(angle);
           const y = 50 + 32 * Math.sin(angle);
-          const lastMsg = [...messages].reverse().find(m => m.rockId === rock.id);
+          const lastMsg = [...messages].reverse().find(m => m.rockId === rock.id && !m.system);
+          const msgAge = lastMsg ? Date.now() - (lastMsg.timestamp || 0) : Infinity;
+          const showBubble = lastMsg && msgAge < 5000;
           const bubbleBelow = y < 42;
           const onRight = x > 65;
           const onLeft = x < 35;
           return (
             <div key={rock.id} style={{ position: "absolute", left: `${x}%`, top: `${y}%`, transform: "translate(-50%,-50%)", zIndex: speakingId === rock.id ? 10 : 5 }}>
-              {lastMsg && !lastMsg.system && (
+              {showBubble && (
                 <div style={{
-                  ...styles.bubble,
-                  ...(rock.id === "me" ? styles.myBubble : {}),
+                  ...styles.bubble, ...(rock.id === "me" ? styles.myBubble : {}),
                   ...(bubbleBelow ? { bottom: "auto", top: "calc(100% + 4px)" } : {}),
                   ...(onRight ? { left: "auto", right: 0, transform: "none" } : {}),
                   ...(onLeft ? { left: 0, transform: "none" } : {}),
@@ -324,12 +476,9 @@ export default function RockTalk() {
               <div style={{ textAlign: "center" }}>
                 <RockSVG rock={rock} size={rock.id === "me" ? 72 : 58} speaking={speakingId === rock.id} wiggle={wiggleId === rock.id} />
                 <div style={styles.rockLabel}>{rock.name}</div>
-                {rock.id === "me"
-                  ? <div style={{ ...styles.tag, color:"#8B7355" }}>● you</div>
-                  : <div style={{ ...styles.tag, color: rock.isBot ? "#4a4040" : "#4a8a5a" }}>
-                      {rock.isBot ? "🤖 bot" : "🟢 real"}
-                    </div>
-                }
+                <div style={{ ...styles.tag, color: rock.id === "me" ? "#8B7355" : rock.isBot ? "#4a4040" : "#4a8a5a" }}>
+                  {rock.id === "me" ? "● you" : rock.isBot ? "🤖 bot" : "🟢 real"}
+                </div>
               </div>
             </div>
           );
@@ -346,14 +495,10 @@ export default function RockTalk() {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* Blocked message warning */}
-      {blockedMsg && (
-        <div style={styles.blockedBanner}>{blockedMsg}</div>
-      )}
+      {blockedMsg && <div style={styles.blockedBanner}>{blockedMsg}</div>}
 
       <div style={styles.inputRow}>
-        <input
-          style={styles.input} value={input}
+        <input style={styles.input} value={input}
           onChange={e => setInput(e.target.value)}
           onKeyDown={e => e.key === "Enter" && sendMessage()}
           placeholder={isSending ? "checking message..." : "say something, rock..."}
@@ -372,18 +517,16 @@ function WelcomeScreen({ onNext }) {
   const [val, setVal] = useState("");
   const [err, setErr] = useState("");
   const [checking, setChecking] = useState(false);
-
   const submit = async () => {
     const trimmed = val.trim();
     if (trimmed.length < 2) { setErr("needs at least 2 characters"); return; }
     if (trimmed.length > 20) { setErr("max 20 characters"); return; }
     setChecking(true); setErr("");
-    const result = await checkUsername(trimmed);
+    const result = await checkContent(trimmed, "username");
     setChecking(false);
     if (!result.allowed) { setErr(`🚫 ${result.reason || "pick a rock-friendly name!"}`); return; }
     onNext(trimmed);
   };
-
   return (
     <div style={styles.app}>
       <style>{globalStyles}</style>
@@ -393,22 +536,16 @@ function WelcomeScreen({ onNext }) {
         <p style={styles.subtitle}>a social app for rocks who can't move but have a lot to say</p>
         <div style={styles.card}>
           <label style={styles.label}>pick your rock name</label>
-          <input
-            style={styles.input} value={val}
+          <input style={styles.input} value={val}
             onChange={e => { setVal(e.target.value); setErr(""); }}
             onKeyDown={e => e.key === "Enter" && submit()}
-            placeholder="e.g. Gneiss Person" maxLength={20} autoFocus
-          />
-          <div style={{ fontSize:10, color: val.length >= 18 ? "#c0756a" : "#5a5050", textAlign:"right", marginTop:4 }}>
-            {val.length}/20
-          </div>
+            placeholder="e.g. Gneiss Person" maxLength={20} autoFocus />
+          <div style={{ fontSize: 10, color: val.length >= 18 ? "#c0756a" : "#5a5050", textAlign: "right", marginTop: 4 }}>{val.length}/20</div>
           {err && <div style={styles.err}>{err}</div>}
           <button style={{ ...styles.primaryBtn, opacity: checking ? 0.7 : 1 }} onClick={submit} disabled={checking}>
             {checking ? "checking name... 🪨" : "become a rock →"}
           </button>
-          <div style={{ fontSize: 10, color: "#5a5050", marginTop: 10, textAlign: "center" }}>
-            names are checked for appropriateness
-          </div>
+          <div style={{ fontSize: 10, color: "#5a5050", marginTop: 10, textAlign: "center" }}>names are checked for appropriateness</div>
         </div>
       </div>
     </div>
@@ -417,6 +554,7 @@ function WelcomeScreen({ onNext }) {
 
 // ─── Customize Screen ────────────────────────────────────────────────────────
 function CustomizeScreen({ username, rock, setRock, onEnter }) {
+  const [entering, setEntering] = useState(false);
   const previewRock = { ...rock, id: "preview", name: username };
   return (
     <div style={styles.app}>
@@ -424,9 +562,7 @@ function CustomizeScreen({ username, rock, setRock, onEnter }) {
       <div style={styles.centered}>
         <h2 style={styles.bigTitle}>customize your rock</h2>
         <p style={styles.subtitle}>hello, {username}</p>
-        <div style={{ margin: "20px 0", animation: "float 3s ease-in-out infinite" }}>
-          <RockSVG rock={previewRock} size={120} />
-        </div>
+        <div style={{ margin: "20px 0", animation: "float 3s ease-in-out infinite" }}><RockSVG rock={previewRock} size={120} /></div>
         <div style={styles.card}>
           <label style={styles.label}>rock color</label>
           <div style={styles.colorRow}>
@@ -453,7 +589,9 @@ function CustomizeScreen({ username, rock, setRock, onEnter }) {
               </button>
             ))}
           </div>
-          <button style={{ ...styles.primaryBtn, marginTop: 20 }} onClick={onEnter}>enter the rock room →</button>
+          <button style={{ ...styles.primaryBtn, marginTop: 20, opacity: entering ? 0.7 : 1 }} onClick={async () => { setEntering(true); await onEnter(); }} disabled={entering}>
+            {entering ? "finding your room... 🪨" : "enter the rock room →"}
+          </button>
         </div>
       </div>
     </div>
@@ -491,8 +629,6 @@ const styles = {
   logo: { fontFamily:"'Fraunces',serif", fontSize:20, fontWeight:700, flex:1 },
   roomBadge: { background:"rgba(255,255,255,0.07)", borderRadius:20, padding:"4px 10px", fontSize:11, color:"#9a8f85" },
   leaveBtn: { background:"none", border:"1px solid rgba(255,255,255,0.15)", borderRadius:20, padding:"4px 12px", color:"#9a8f85", fontSize:11, cursor:"pointer", fontFamily:"'DM Mono',monospace" },
-  demoBanner: { display:"flex", alignItems:"center", gap:8, padding:"6px 16px", background:"rgba(255,255,255,0.03)", borderBottom:"1px solid rgba(255,255,255,0.05)", fontSize:11, color:"#6a6050" },
-  demoBtn: { background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.1)", borderRadius:12, padding:"3px 10px", color:"#9a8f85", fontSize:11, cursor:"pointer", fontFamily:"'DM Mono',monospace" },
   scene: { position:"relative", height:320, flexShrink:0, overflow:"visible", padding:"0 60px" },
   ground: { position:"absolute", bottom:0, left:"-10%", right:"-10%", height:60, background:"linear-gradient(to top,#2a2018,transparent)", borderRadius:"50% 50% 0 0/30px 30px 0 0" },
   bubble: { position:"absolute", bottom:"calc(100% + 4px)", left:"50%", transform:"translateX(-50%)", background:"rgba(40,34,28,0.95)", border:"1px solid rgba(255,255,255,0.12)", borderRadius:10, padding:"6px 10px", fontSize:11, color:"#e8ddd0", whiteSpace:"normal", wordBreak:"break-word", width:"max-content", maxWidth:150, textAlign:"center", animation:"fadeIn 0.2s ease", zIndex:20, boxShadow:"0 4px 12px rgba(0,0,0,0.4)" },
