@@ -107,13 +107,36 @@ const HARD_BLOCKED = [
   "retard","retarded",
 ];
 
+// Known bad domain patterns
+const BLOCKED_DOMAINS = [
+  "porn","xxx","sex","nude","naked","onlyfans","adult","nsfw",
+  "malware","phishing","virus","hack","crack","warez","torrent",
+  "onion","darkweb","grabify","iplogger","ipgrabber","stresser","booter",
+];
+
+// Suspicious link patterns
+const LINK_PATTERN = /https?:\/\/[^\s]+|www\.[^\s]+|[^\s]+\.(com|net|org|io|co|app|xyz|ru|tk|ml|ga|cf|gq|top|club|site|online|fun|live)[^\s]*/gi;
+
 function hardBlock(text) {
-  const lower = text.toLowerCase().replace(/[^a-z0-9\s]/g, "");
+  // Check slurs and harmful phrases
+  const lower = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ");
   for (const word of HARD_BLOCKED) {
     if (lower.includes(word)) {
       return { allowed: false, reason: "that language isn't allowed here — keep it rock-friendly 🪨" };
     }
   }
+
+  // Check for any URLs — block all links for safety
+  const links = text.match(LINK_PATTERN);
+  if (links) {
+    // Allow if it looks like a rock-related or innocent mention without http
+    const hasHttp = links.some(l => l.startsWith("http"));
+    const hasBadDomain = links.some(l => BLOCKED_DOMAINS.some(d => l.toLowerCase().includes(d)));
+    if (hasHttp || hasBadDomain) {
+      return { allowed: false, reason: "links aren't allowed in Rock Talk — just rocks and words 🪨" };
+    }
+  }
+
   return null;
 }
 
@@ -231,66 +254,52 @@ export default function RockTalk() {
       { id: "sys_join", rockId: "system", text: `You rolled into Room #${rn}. ${humanCount > 1 ? `${humanCount - 1} other rock${humanCount > 2 ? "s are" : " is"} here!` : "Bots are keeping you company..."}`, system: true },
     ]);
 
-    // Subscribe to realtime via broadcast channel
-    const channel = supabase.channel(`room_${rn}`, { config: { broadcast: { self: false } } })
+    // Supabase Presence for reliable who-is-in-the-room tracking
+    const channel = supabase.channel(`room_${rn}`)
       .on("broadcast", { event: "message" }, ({ payload }) => {
         if (payload.session_id === SESSION_ID) return;
         setMessages(prev => [...prev, { id: payload.id, rockId: payload.session_id, rockName: payload.user_name, text: payload.text, isBot: false, timestamp: Date.now() }]);
         setSpeakingId(payload.session_id);
         setTimeout(() => setSpeakingId(null), 2500);
-        // Add rock to scene if not already there
+      })
+      .on("presence", { event: "sync" }, () => {
+        const state = channel.presenceState();
+        const humans = Object.values(state).flat().map(p => ({
+          id: p.session_id, name: p.user_name,
+          color: p.rock_color || COLORS[0],
+          shapeIndex: p.rock_shape || 0,
+          accessory: p.rock_accessory || "none",
+          isBot: false,
+        })).filter(p => p.id !== SESSION_ID);
         setRoomRocks(prev => {
-          if (prev.find(r => r.id === payload.session_id)) return prev;
           const bots = prev.filter(r => r.isBot);
-          const newRock = { id: payload.session_id, name: payload.user_name, color: payload.rock_color || COLORS[0], shapeIndex: payload.rock_shape || 0, accessory: payload.rock_accessory || "none", isBot: false };
-          if (bots.length > 0) return [...prev.filter((r, i) => !r.isBot || i !== prev.findIndex(x => x.isBot)), newRock];
-          return [...prev, newRock];
+          const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
+          return [...humans, ...bots.slice(0, botCount)];
         });
       })
-      .on("broadcast", { event: "ping" }, ({ payload }) => {
-        // New joiner requesting everyone to announce themselves
-        if (payload.session_id !== SESSION_ID && channelRef.current) {
-          setTimeout(() => {
-            channelRef.current.send({ type: "broadcast", event: "presence", payload: { type: "join", session_id: SESSION_ID, user_name: name, rock_color: rock.color, rock_shape: rock.shapeIndex, rock_accessory: rock.accessory } });
-          }, Math.random() * 300); // stagger responses so they dont all fire at once
-        }
-      })
-      .on("broadcast", { event: "presence" }, ({ payload }) => {
-        // Someone joined or left
-        if (payload.type === "join" && payload.session_id !== SESSION_ID) {
+      .on("presence", { event: "join" }, ({ newPresences }) => {
+        newPresences.forEach(p => {
+          if (p.session_id === SESSION_ID) return;
           setMessages(prev => {
-            const alreadyAnnounced = prev.some(m => m.system && m.text && m.text.includes(payload.user_name) && m.text.includes("rolled in"));
-            if (alreadyAnnounced) return prev;
-            return [...prev, { id: Date.now(), rockId: "system", text: `${payload.user_name} just rolled in 🪨`, system: true }];
+            const already = prev.some(m => m.system && m.text?.includes(p.user_name) && m.text?.includes("rolled in"));
+            if (already) return prev;
+            return [...prev, { id: Date.now(), rockId: "system", text: `${p.user_name} just rolled in 🪨`, system: true }];
           });
-          setRoomRocks(prev => {
-            if (prev.find(r => r.id === payload.session_id)) return prev;
-            const bots = prev.filter(r => r.isBot);
-            const newRock = { id: payload.session_id, name: payload.user_name, color: payload.rock_color || COLORS[0], shapeIndex: payload.rock_shape || 0, accessory: payload.rock_accessory || "none", isBot: false };
-            if (bots.length > 0) return [...prev.filter((r, i) => !r.isBot || i !== prev.findIndex(x => x.isBot)), newRock];
-            return [...prev, newRock];
-          });
-        } else if (payload.type === "leave" && payload.session_id !== SESSION_ID) {
-          setMessages(prev => [...prev, { id: Date.now(), rockId: "system", text: `${payload.user_name} rolled away`, system: true }]);
-          setRoomRocks(prev => {
-            const remaining = prev.filter(r => r.id !== payload.session_id);
-            const humanCount = remaining.filter(r => !r.isBot).length;
-            const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humanCount - 2));
-            const currentBots = remaining.filter(r => r.isBot);
-            const newBots = botCount > currentBots.length
-              ? [...currentBots, ...Array.from({ length: botCount - currentBots.length }, (_, i) => makeBot((rn * 10 + i + 50) % BOT_NAMES.length))]
-              : currentBots.slice(0, botCount);
-            return [...remaining.filter(r => !r.isBot), ...newBots];
-          });
-        }
+        });
+      })
+      .on("presence", { event: "leave" }, ({ leftPresences }) => {
+        leftPresences.forEach(p => {
+          if (p.session_id === SESSION_ID) return;
+          setMessages(prev => [...prev, { id: Date.now(), rockId: "system", text: `${p.user_name} rolled away`, system: true }]);
+        });
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
-          // Ask everyone already in room to announce themselves
-          await channel.send({ type: "broadcast", event: "ping", payload: { session_id: SESSION_ID } });
-          // Then announce ourselves
-          await channel.send({ type: "broadcast", event: "presence", payload: { type: "join", session_id: SESSION_ID, user_name: name, rock_color: rock.color, rock_shape: rock.shapeIndex, rock_accessory: rock.accessory } });
-
+          await channel.track({
+            session_id: SESSION_ID, user_name: name,
+            rock_color: rock.color, rock_shape: rock.shapeIndex,
+            rock_accessory: rock.accessory,
+          });
         }
       });
     channelRef.current = channel;
@@ -343,7 +352,7 @@ export default function RockTalk() {
     const currentRoom = roomNumber;
 
     if (channelRef.current) {
-      await channelRef.current.send({ type: "broadcast", event: "presence", payload: { type: "leave", session_id: SESSION_ID, user_name: username } });
+      await channelRef.current.untrack();
       supabase.removeChannel(channelRef.current);
       channelRef.current = null;
     }
