@@ -220,12 +220,14 @@ export default function RockTalk() {
           return [...prev, { id: Date.now(), rockId: "system", text: `${payload.name} just rolled in 🪨`, system: true }];
         });
         refreshRoomRocks(rn);
-        // Reply with our own presence so the newcomer sees us
-        setTimeout(() => {
-          if (channelRef.current) {
-            channelRef.current.send({ type: "broadcast", event: "join", payload: { sid: SESSION_ID, name } });
-          }
-        }, 300 + Math.random() * 400);
+        // Reply with our own presence so the newcomer sees us — try twice with delays
+        [500, 2000].forEach(delay => {
+          setTimeout(() => {
+            if (channelRef.current) {
+              channelRef.current.send({ type: "broadcast", event: "join", payload: { sid: SESSION_ID, name } });
+            }
+          }, delay + Math.random() * 300);
+        });
       })
       .on("broadcast", { event: "leave" }, ({ payload }) => {
         if (payload.sid === SESSION_ID) return;
@@ -234,7 +236,16 @@ export default function RockTalk() {
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
+          // Announce immediately
           await channel.send({ type: "broadcast", event: "join", payload: { sid: SESSION_ID, name } });
+          // Also refresh rocks from DB right away to catch anyone already here
+          await refreshRoomRocks(rn);
+          // Announce again after a delay to catch late subscribers
+          setTimeout(async () => {
+            if (channelRef.current) {
+              await channelRef.current.send({ type: "broadcast", event: "join", payload: { sid: SESSION_ID, name } });
+            }
+          }, 2000);
         }
       });
     channelRef.current = channel;
