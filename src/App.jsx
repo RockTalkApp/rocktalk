@@ -113,6 +113,24 @@ function getSessionId() {
   return id;
 }
 
+// TEMP (testing only): allow ?room=1234 in the URL to force a specific room,
+// so multiple windows can be put in the same room to reproduce the presence bug.
+function getForcedRoom() {
+  const r = parseInt(new URLSearchParams(window.location.search).get("room"), 10);
+  return Number.isInteger(r) && r > 0 ? r : null;
+}
+
+// The join_or_create_room RPC can come back in several shapes depending on how it's
+// declared (scalar int, numeric string, [n], [{...}], {...}). Normalize any of them to a
+// positive integer room number, or null if it's unusable — so we never write NaN/NULL.
+function coerceRoomNumber(rnData) {
+  let v = rnData;
+  if (Array.isArray(v)) v = v[0];
+  if (v && typeof v === "object") v = Object.values(v)[0];
+  const n = parseInt(v, 10);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
 const COLORS = ["#8B7355","#6B8E6B","#8E6B7A","#6B7A8E","#8E8E6B","#7A6B8E","#6B8E8E","#8E7A6B"];
 const COLOR_NAMES = ["Sandstone","Mossy","Rose Quartz","Slate Blue","Citrine","Amethyst","Aquamarine","Amber"];
 const ROOM_CAPACITY = 6;
@@ -189,13 +207,20 @@ export default function RockTalk() {
     clearInterval(botTimerRef.current);
     if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
 
-    // Get room
-    let rn;
-    if (forceRoom) {
-      rn = forceRoom;
-    } else {
-      const { data: rnData } = await supabase.rpc("join_or_create_room");
-      rn = parseInt(rnData);
+    // Get room — never let current_room end up NULL.
+    let rn = coerceRoomNumber(forceRoom);
+    if (!rn) {
+      for (let attempt = 0; attempt < 3 && !rn; attempt++) {
+        const { data: rnData, error } = await supabase.rpc("join_or_create_room");
+        if (error) console.warn("join_or_create_room failed:", error.message);
+        rn = coerceRoomNumber(rnData);
+      }
+      // Last resort: the RPC never gave us a usable room — create a fresh one so the
+      // user still lands somewhere with a valid (non-NULL) current_room.
+      if (!rn) {
+        rn = Math.floor(Math.random() * 9999) + 1;
+        await supabase.from("rooms").insert({ room_number: rn, human_count: 1 });
+      }
     }
     setRoomNumber(rn);
     roomNumberRef.current = rn;
@@ -410,7 +435,7 @@ export default function RockTalk() {
   if (screen === "customize") return (
     <CustomizeScreen username={username} rock={myRock} setRock={setMyRock} onEnter={async () => {
       setScreen("room");
-      await joinRoom(myRock, username);
+      await joinRoom(myRock, username, getForcedRoom());
     }} />
   );
 
@@ -481,8 +506,6 @@ function WelcomeScreen({ onNext }) {
     if (trimmed.length > 20) { setErr("max 20 characters"); return; }
     const check = hardBlock(trimmed);
     if (check && !check.allowed) { setErr(`🚫 ${check.reason}`); return; }
-    const check = hardBlock(trimmed);
-    if (!check.allowed) { setErr(`🚫 ${check.reason}`); return; }
     onNext(trimmed);
   };
   return (
