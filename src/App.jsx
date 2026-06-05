@@ -147,7 +147,7 @@ export default function RockTalk() {
   useEffect(() => { myRockRef.current = myRock; }, [myRock]);
 
   const refreshRoomRocks = useCallback(async (rn) => {
-    const cutoff = new Date(Date.now() - 45000).toISOString();
+    const cutoff = new Date(Date.now() - 120000).toISOString(); // 2 min cutoff
     const { data } = await supabase.from("users")
       .select("*")
       .eq("current_room", parseInt(rn))
@@ -203,10 +203,15 @@ export default function RockTalk() {
       last_seen: new Date().toISOString(),
     }, { onConflict: "session_id" });
 
-    // Load initial rocks
+    // Load initial rocks - retry a few times to catch anyone already in room
     await refreshRoomRocks(rn);
 
     setMessages([{ id: "sys", rockId: "system", text: `You rolled into Room #${rn}. Bots are keeping you company...`, system: true }]);
+
+    // Retry refreshes to catch people already in room
+    [1000, 3000, 6000].forEach(delay => {
+      setTimeout(() => refreshRoomRocks(rn), delay);
+    });
 
     // Broadcast channel for messages only
     const channel = supabase.channel(`room_${rn}`)
@@ -215,6 +220,13 @@ export default function RockTalk() {
         setMessages(prev => [...prev, { id: payload.id, rockId: payload.sid, rockName: payload.name, text: payload.text, timestamp: Date.now() }]);
         setSpeakingId(payload.sid);
         setTimeout(() => setSpeakingId(null), 2500);
+        // Add their rock if not already showing
+        setOtherRocks(prev => {
+          if (prev.find(r => r.id === payload.sid)) return prev;
+          const newRock = { id: payload.sid, name: payload.name, color: payload.rock_color || COLORS[0], shapeIndex: parseInt(payload.rock_shape) || 0, accessory: payload.rock_accessory || "none", isBot: false };
+          const bots = prev.filter(r => r.isBot);
+          return [...prev.filter(r => !r.isBot), newRock, ...bots.slice(0, Math.max(0, bots.length - 1))];
+        });
       })
       .on("broadcast", { event: "join" }, ({ payload }) => {
         if (payload.sid === SESSION_ID) return;
@@ -223,13 +235,23 @@ export default function RockTalk() {
           return [...prev, { id: Date.now(), rockId: "system", text: `${payload.name} just rolled in 🪨`, system: true }];
         });
         refreshRoomRocks(rn);
-        // Reply with our own presence so the newcomer sees us — try twice with delays
+        // Reply with "here" event (not "join") so newcomer sees us without triggering join/leave cycle
         [500, 2000].forEach(delay => {
           setTimeout(() => {
             if (channelRef.current) {
-              channelRef.current.send({ type: "broadcast", event: "join", payload: { sid: SESSION_ID, name } });
+              channelRef.current.send({ type: "broadcast", event: "here", payload: { sid: SESSION_ID, name, rock_color: rock.color, rock_shape: rock.shapeIndex, rock_accessory: rock.accessory } });
             }
           }, delay + Math.random() * 300);
+        });
+      })
+      .on("broadcast", { event: "here" }, ({ payload }) => {
+        if (payload.sid === SESSION_ID) return;
+        // Someone announcing they're already here - just add their rock silently
+        setOtherRocks(prev => {
+          if (prev.find(r => r.id === payload.sid)) return prev; // already showing
+          const newRock = { id: payload.sid, name: payload.name, color: payload.rock_color || COLORS[0], shapeIndex: parseInt(payload.rock_shape) || 0, accessory: payload.rock_accessory || "none", isBot: false };
+          const bots = prev.filter(r => r.isBot);
+          return [...prev.filter(r => !r.isBot), newRock, ...bots.slice(0, Math.max(0, bots.length - 1))];
         });
       })
       .on("broadcast", { event: "leave" }, ({ payload }) => {
@@ -248,10 +270,10 @@ export default function RockTalk() {
           await channel.send({ type: "broadcast", event: "join", payload: { sid: SESSION_ID, name } });
           // Also refresh rocks from DB right away to catch anyone already here
           await refreshRoomRocks(rn);
-          // Announce again after a delay to catch late subscribers
+          // Re-announce with "here" after delay to catch late subscribers
           setTimeout(async () => {
             if (channelRef.current) {
-              await channelRef.current.send({ type: "broadcast", event: "join", payload: { sid: SESSION_ID, name } });
+              await channelRef.current.send({ type: "broadcast", event: "here", payload: { sid: SESSION_ID, name, rock_color: rock.color, rock_shape: rock.shapeIndex, rock_accessory: rock.accessory } });
             }
           }, 2000);
         }
@@ -262,11 +284,35 @@ export default function RockTalk() {
     heartbeatRef.current = setInterval(async () => {
       const currentRoom = roomNumberRef.current;
       if (!currentRoom) return;
+      // Update own heartbeat
       await supabase.from("users").update({
         last_seen: new Date().toISOString(),
         current_room: parseInt(currentRoom),
       }).eq("session_id", SESSION_ID);
-      await refreshRoomRocks(currentRoom);
+      // Only ADD rocks from DB refresh, never remove (removal via leave broadcast only)
+      const cutoff = new Date(Date.now() - 120000).toISOString();
+      const { data } = await supabase.from("users")
+        .select("*")
+        .eq("current_room", parseInt(currentRoom))
+        .neq("session_id", SESSION_ID)
+        .gt("last_seen", cutoff);
+      if (data && data.length > 0) {
+        const humans = data.map(u => ({
+          id: u.session_id, name: u.user_name,
+          color: u.rock_color || COLORS[0],
+          shapeIndex: parseInt(u.rock_shape) || 0,
+          accessory: u.rock_accessory || "none",
+          isBot: false,
+        }));
+        setOtherRocks(prev => {
+          const existingIds = prev.filter(r => !r.isBot).map(r => r.id);
+          const newRocks = humans.filter(h => !existingIds.includes(h.id));
+          if (newRocks.length === 0) return prev; // nothing to add
+          const bots = prev.filter(r => r.isBot);
+          const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - (existingIds.length + newRocks.length) - 1));
+          return [...prev.filter(r => !r.isBot), ...newRocks, ...bots.slice(0, botCount)];
+        });
+      }
     }, 15000);
 
     // Bot chat timer — only when no humans present
