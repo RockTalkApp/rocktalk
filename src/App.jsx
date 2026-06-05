@@ -184,7 +184,8 @@ export default function RockTalk() {
   const [input, setInput] = useState("");
   const [blockedMsg, setBlockedMsg] = useState("");
   const [roomNumber, setRoomNumber] = useState(null);
-  const [roomRocks, setRoomRocks] = useState([]);
+  const [humanRocksInRoom, setHumanRocksInRoom] = useState([]);
+  const [botRocksInRoom, setBotRocksInRoom] = useState([]);
   const [speakingId, setSpeakingId] = useState(null);
   const [wiggleId, setWiggleId] = useState(null);
   const [isLoading, setIsLoading] = useState(false);
@@ -234,7 +235,8 @@ export default function RockTalk() {
     const humanCount = humanRocks.length + 1;
     const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humanCount - 1));
     const bots = Array.from({ length: botCount }, (_, i) => makeBot((rn * 10 + i) % BOT_NAMES.length));
-    setRoomRocks([...humanRocks, ...bots]);
+    setHumanRocksInRoom(humanRocks);
+    setBotRocksInRoom(bots);
 
     // Fresh start — no chat history shown on join
     setMessages([
@@ -258,17 +260,17 @@ export default function RockTalk() {
           accessory: p.rock_accessory || "none",
           isBot: false,
         })).filter(p => p.id !== SESSION_ID);
-
-        setRoomRocks(prev => {
-          // Keep existing bots, just update human list
-          const existingBots = prev.filter(r => r.isBot);
+        // Only update humans — never touch bots here
+        setHumanRocksInRoom(prev => {
+          const prevIds = prev.map(r => r.id).sort().join(",");
+          const newIds = humans.map(r => r.id).sort().join(",");
+          if (prevIds === newIds) return prev;
+          return humans;
+        });
+        // Adjust bot count based on human count
+        setBotRocksInRoom(prev => {
           const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
-          const bots = existingBots.slice(0, botCount);
-          // Only update if something actually changed
-          const existingHumanIds = prev.filter(r => !r.isBot).map(r => r.id).sort().join(",");
-          const newHumanIds = humans.map(r => r.id).sort().join(",");
-          if (existingHumanIds === newHumanIds && existingBots.length === bots.length) return prev;
-          return [...humans, ...bots];
+          return prev.slice(0, botCount);
         });
       })
       .on("presence", { event: "join" }, ({ newPresences }) => {
@@ -279,20 +281,22 @@ export default function RockTalk() {
             if (already) return prev;
             return [...prev, { id: Date.now(), rockId: "system", text: `${p.user_name} just rolled in 🪨`, system: true }];
           });
+          // Add human rock directly — dont wait for sync
+          setHumanRocksInRoom(prev => {
+            if (prev.find(r => r.id === p.session_id)) return prev;
+            const newRock = { id: p.session_id, name: p.user_name, color: p.rock_color || COLORS[0], shapeIndex: p.rock_shape || 0, accessory: p.rock_accessory || "none", isBot: false };
+            return [...prev, newRock];
+          });
+          // Remove a bot to make room
+          setBotRocksInRoom(prev => prev.slice(0, Math.max(0, prev.length - 1)));
         });
       })
       .on("presence", { event: "leave" }, ({ leftPresences }) => {
         leftPresences.forEach(p => {
           if (p.session_id === SESSION_ID) return;
           setMessages(prev => [...prev, { id: Date.now(), rockId: "system", text: `${p.user_name} rolled away`, system: true }]);
-          // Remove their rock immediately
-          setRoomRocks(prev => {
-            const remaining = prev.filter(r => r.id !== p.session_id);
-            const humanCount = remaining.filter(r => !r.isBot).length;
-            const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humanCount - 1));
-            const bots = remaining.filter(r => r.isBot).slice(0, botCount);
-            return [...remaining.filter(r => !r.isBot), ...bots];
-          });
+          // Remove their human rock immediately
+          setHumanRocksInRoom(prev => prev.filter(r => r.id !== p.session_id));
         });
       })
       .subscribe(async (status) => {
@@ -318,30 +322,28 @@ export default function RockTalk() {
       // Refresh room rocks after cleanup
       const { data: freshUsers } = await supabase.from("users").select("*").eq("current_room", rn).neq("session_id", SESSION_ID);
       if (freshUsers) {
-        setRoomRocks(prev => {
-          const bots = prev.filter(r => r.isBot);
-          const humans = freshUsers.map(u => ({ id: u.session_id, name: u.user_name, color: u.rock_color, shapeIndex: u.rock_shape, accessory: u.rock_accessory, isBot: false }));
-          const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
-          return [...humans, ...bots.slice(0, botCount)];
-        });
+        const humans = freshUsers.map(u => ({ id: u.session_id, name: u.user_name, color: u.rock_color, shapeIndex: u.rock_shape, accessory: u.rock_accessory, isBot: false }));
+        setHumanRocksInRoom(humans);
+        setBotRocksInRoom(prev => prev.slice(0, Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1))));
       }
     };
     setTimeout(runCleanup, 60000);
 
     // Bot chat timer — only fires if no other humans in room
     botTimerRef.current = setInterval(() => {
-      setRoomRocks(prev => {
-        const humans = prev.filter(r => !r.isBot);
-        if (humans.length > 0) return prev; // real humans present — bots stay quiet
-        const bots = prev.filter(r => r.isBot);
-        if (!bots.length) return prev;
-        if (Math.random() > 0.2) return prev; // only 20% chance
-        const bot = bots[Math.floor(Math.random() * bots.length)];
-        const line = BOT_LINES[Math.floor(Math.random() * BOT_LINES.length)];
-        setSpeakingId(bot.id);
-        setTimeout(() => setSpeakingId(null), 2500);
-        setMessages(m => [...m, { id: Date.now(), rockId: bot.id, rockName: bot.name, text: line, timestamp: Date.now() }]);
-        return prev;
+      setHumanRocksInRoom(humans => {
+        if (humans.length > 0) return humans; // real humans present — bots stay quiet
+        setBotRocksInRoom(bots => {
+          if (!bots.length) return bots;
+          if (Math.random() > 0.2) return bots; // only 20% chance
+          const bot = bots[Math.floor(Math.random() * bots.length)];
+          const line = BOT_LINES[Math.floor(Math.random() * BOT_LINES.length)];
+          setSpeakingId(bot.id);
+          setTimeout(() => setSpeakingId(null), 2500);
+          setMessages(m => [...m, { id: Date.now(), rockId: bot.id, rockName: bot.name, text: line, timestamp: Date.now() }]);
+          return bots;
+        });
+        return humans;
       });
     }, 8000);
 
@@ -438,9 +440,8 @@ export default function RockTalk() {
     });
 
     // Bot AI response — only if no other humans in room, 20% chance
-    const humanRocks = roomRocks.filter(r => !r.isBot);
-    if (humanRocks.length === 0 && Math.random() < 0.2) {
-      const bots = roomRocks.filter(r => r.isBot);
+    if (humanRocksInRoom.length === 0 && Math.random() < 0.2) {
+      const bots = botRocksInRoom;
       if (bots.length > 0) {
         setIsLoading(true);
         const bot = bots[Math.floor(Math.random() * bots.length)];
@@ -478,6 +479,7 @@ export default function RockTalk() {
   );
 
   const myRockFull = { ...myRock, id: "me", name: username };
+  const roomRocks = [...humanRocksInRoom, ...botRocksInRoom];
   const allRocks = [myRockFull, ...roomRocks];
 
   return (
