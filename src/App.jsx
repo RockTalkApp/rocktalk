@@ -243,99 +243,77 @@ export default function RockTalk() {
       { id: "sys_join", rockId: "system", text: `You rolled into Room #${rn}. ${humanCount > 1 ? `${humanCount - 1} other rock${humanCount > 2 ? "s are" : " is"} here!` : "Bots are keeping you company..."}`, system: true },
     ]);
 
-    // Supabase Presence for reliable who-is-in-the-room tracking
+    // Use broadcast for messages only — DB polling for rock presence (most reliable)
     const channel = supabase.channel(`room_${rn}`)
       .on("broadcast", { event: "message" }, ({ payload }) => {
         if (payload.session_id === SESSION_ID) return;
         setMessages(prev => [...prev, { id: payload.id, rockId: payload.session_id, rockName: payload.user_name, text: payload.text, isBot: false, timestamp: Date.now() }]);
         setSpeakingId(payload.session_id);
         setTimeout(() => setSpeakingId(null), 2500);
-      })
-      .on("presence", { event: "sync" }, () => {
-        const state = channel.presenceState();
-        const allPresent = Object.values(state).flat();
-        const humans = allPresent.map(p => ({
-          id: p.session_id, name: p.user_name,
-          color: p.rock_color || COLORS[0],
-          shapeIndex: p.rock_shape || 0,
-          accessory: p.rock_accessory || "none",
-          isBot: false,
-        })).filter(p => p.id !== SESSION_ID);
-
-        // Only update if we got a non-empty list OR if we can confirm room is genuinely empty
-        // Never wipe humans based on an empty sync (can happen during reconnect)
+        // Also add their rock if not visible — messages are proof they exist
         setHumanRocksInRoom(prev => {
-          if (humans.length === 0 && prev.length > 0) return prev; // ignore empty syncs
-          const prevIds = prev.map(r => r.id).sort().join(",");
-          const newIds = humans.map(r => r.id).sort().join(",");
-          if (prevIds === newIds) return prev;
-          return humans;
-        });
-        if (humans.length > 0) {
-          setBotRocksInRoom(prev => {
-            const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
-            return prev.slice(0, botCount);
-          });
-        }
-      })
-      .on("presence", { event: "join" }, ({ newPresences }) => {
-        newPresences.forEach(p => {
-          if (p.session_id === SESSION_ID) return;
-          setMessages(prev => {
-            const already = prev.some(m => m.system && m.text?.includes(p.user_name) && m.text?.includes("rolled in"));
-            if (already) return prev;
-            return [...prev, { id: Date.now(), rockId: "system", text: `${p.user_name} just rolled in 🪨`, system: true }];
-          });
-          // Add human rock directly — dont wait for sync
-          setHumanRocksInRoom(prev => {
-            if (prev.find(r => r.id === p.session_id)) return prev;
-            const newRock = { id: p.session_id, name: p.user_name, color: p.rock_color || COLORS[0], shapeIndex: p.rock_shape || 0, accessory: p.rock_accessory || "none", isBot: false };
-            return [...prev, newRock];
-          });
-          // Remove a bot to make room
-          setBotRocksInRoom(prev => prev.slice(0, Math.max(0, prev.length - 1)));
+          if (prev.find(r => r.id === payload.session_id)) return prev;
+          const newRock = { id: payload.session_id, name: payload.user_name, color: payload.rock_color || COLORS[0], shapeIndex: payload.rock_shape || 0, accessory: payload.rock_accessory || "none", isBot: false };
+          setBotRocksInRoom(b => b.slice(0, Math.max(0, b.length - 1)));
+          return [...prev, newRock];
         });
       })
-      .on("presence", { event: "leave" }, ({ leftPresences }) => {
-        leftPresences.forEach(p => {
-          if (p.session_id === SESSION_ID) return;
-          setMessages(prev => [...prev, { id: Date.now(), rockId: "system", text: `${p.user_name} rolled away`, system: true }]);
-          // Remove their human rock immediately
-          setHumanRocksInRoom(prev => prev.filter(r => r.id !== p.session_id));
+      .on("broadcast", { event: "joined" }, ({ payload }) => {
+        if (payload.session_id === SESSION_ID) return;
+        setMessages(prev => {
+          const already = prev.some(m => m.system && m.text?.includes(payload.user_name) && m.text?.includes("rolled in"));
+          if (already) return prev;
+          return [...prev, { id: Date.now(), rockId: "system", text: `${payload.user_name} just rolled in 🪨`, system: true }];
         });
+        setHumanRocksInRoom(prev => {
+          if (prev.find(r => r.id === payload.session_id)) return prev;
+          const newRock = { id: payload.session_id, name: payload.user_name, color: payload.rock_color || COLORS[0], shapeIndex: payload.rock_shape || 0, accessory: payload.rock_accessory || "none", isBot: false };
+          setBotRocksInRoom(b => b.slice(0, Math.max(0, b.length - 1)));
+          return [...prev, newRock];
+        });
+      })
+      .on("broadcast", { event: "left" }, ({ payload }) => {
+        if (payload.session_id === SESSION_ID) return;
+        setMessages(prev => [...prev, { id: Date.now(), rockId: "system", text: `${payload.user_name} rolled away`, system: true }]);
+        setHumanRocksInRoom(prev => prev.filter(r => r.id !== payload.session_id));
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
-          await channel.track({
-            session_id: SESSION_ID, user_name: name,
-            rock_color: rock.color, rock_shape: rock.shapeIndex,
-            rock_accessory: rock.accessory,
-          });
+          // Announce arrival to everyone
+          await channel.send({ type: "broadcast", event: "joined", payload: { session_id: SESSION_ID, user_name: name, rock_color: rock.color, rock_shape: rock.shapeIndex, rock_accessory: rock.accessory } });
         }
       });
     channelRef.current = channel;
 
-    // Heartbeat — update last_seen every 30 seconds so cleanup knows we're alive
-    // Also re-fetch humans from DB as a fallback in case presence dropped someone
+    // Heartbeat every 15s — update last_seen AND refresh rock list from DB
     clearInterval(heartbeatRef.current);
-    heartbeatRef.current = setInterval(async () => {
+    const refreshRocks = async () => {
       await supabase.from("users").update({ last_seen: new Date().toISOString() }).eq("session_id", SESSION_ID);
-      // Re-fetch current humans in room as fallback
       const { data: freshUsers } = await supabase.from("users")
         .select("*")
         .eq("current_room", rn)
         .neq("session_id", SESSION_ID)
-        .gt("last_seen", new Date(Date.now() - 90000).toISOString());
-      if (freshUsers && freshUsers.length > 0) {
-        const humans = freshUsers.map(u => ({ id: u.session_id, name: u.user_name, color: u.rock_color, shapeIndex: u.rock_shape, accessory: u.rock_accessory, isBot: false }));
-        setHumanRocksInRoom(prev => {
-          const prevIds = prev.map(r => r.id).sort().join(",");
-          const newIds = humans.map(r => r.id).sort().join(",");
-          if (prevIds === newIds) return prev;
-          return humans;
-        });
-      }
-    }, 30000);
+        .gt("last_seen", new Date(Date.now() - 45000).toISOString()); // active in last 45s
+      const humans = (freshUsers || []).map(u => ({ id: u.session_id, name: u.user_name, color: u.rock_color, shapeIndex: u.rock_shape, accessory: u.rock_accessory, isBot: false }));
+      setHumanRocksInRoom(prev => {
+        const prevIds = prev.map(r => r.id).sort().join(",");
+        const newIds = humans.map(r => r.id).sort().join(",");
+        if (prevIds === newIds) return prev;
+        // Show join/leave messages for changes
+        const added = humans.filter(h => !prev.find(p => p.id === h.id));
+        const removed = prev.filter(p => !humans.find(h => h.id === p.id));
+        added.forEach(h => setMessages(m => {
+          const already = m.some(x => x.system && x.text?.includes(h.name) && x.text?.includes("rolled in"));
+          if (already) return m;
+          return [...m, { id: Date.now(), rockId: "system", text: `${h.name} just rolled in 🪨`, system: true }];
+        }));
+        removed.forEach(h => setMessages(m => [...m, { id: Date.now(), rockId: "system", text: `${h.name} rolled away`, system: true }]));
+        setBotRocksInRoom(prev => prev.slice(0, Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1))));
+        return humans;
+      });
+    };
+    refreshRocks(); // run immediately on join
+    heartbeatRef.current = setInterval(refreshRocks, 15000);
 
     // Cleanup stale users every 60 seconds
     const runCleanup = async () => {
@@ -377,7 +355,7 @@ export default function RockTalk() {
     const currentRoom = roomNumber;
 
     if (channelRef.current) {
-      await channelRef.current.untrack();
+      await channelRef.current.send({ type: "broadcast", event: "left", payload: { session_id: SESSION_ID, user_name: username } });
       supabase.removeChannel(channelRef.current);
       channelRef.current = null;
     }
