@@ -220,6 +220,12 @@ export default function RockTalk() {
           return [...prev, { id: Date.now(), rockId: "system", text: `${payload.name} just rolled in 🪨`, system: true }];
         });
         refreshRoomRocks(rn);
+        // Reply with our own presence so the newcomer sees us
+        setTimeout(() => {
+          if (channelRef.current) {
+            channelRef.current.send({ type: "broadcast", event: "join", payload: { sid: SESSION_ID, name } });
+          }
+        }, 300 + Math.random() * 400);
       })
       .on("broadcast", { event: "leave" }, ({ payload }) => {
         if (payload.sid === SESSION_ID) return;
