@@ -218,11 +218,14 @@ export default function RockTalk() {
     }
 
     // Write self to users table
-    await supabase.from("users").upsert({
+    const roomNum = parseInt(rn, 10);
+    const { error: upsertError } = await supabase.from("users").upsert({
       session_id: SESSION_ID, user_name: name,
-      rock_color: rock.color, rock_shape: rock.shapeIndex,
-      rock_accessory: rock.accessory, current_room: rn,
+      rock_color: rock.color, rock_shape: parseInt(rock.shapeIndex, 10),
+      rock_accessory: rock.accessory, current_room: roomNum,
+      last_seen: new Date().toISOString(),
     }, { onConflict: "session_id" });
+    if (upsertError) console.error("Upsert error:", upsertError);
 
     // Load existing users in room
     const { data: existingUsers } = await supabase.from("users").select("*").eq("current_room", rn).neq("session_id", SESSION_ID);
@@ -287,11 +290,12 @@ export default function RockTalk() {
 
     // Heartbeat every 15s — update last_seen AND refresh rock list from DB
     clearInterval(heartbeatRef.current);
+    const roomNum = parseInt(rn, 10);
     const refreshRocks = async () => {
-      await supabase.from("users").update({ last_seen: new Date().toISOString() }).eq("session_id", SESSION_ID);
+      await supabase.from("users").update({ last_seen: new Date().toISOString(), current_room: roomNum }).eq("session_id", SESSION_ID);
       const { data: freshUsers } = await supabase.from("users")
         .select("*")
-        .eq("current_room", rn)
+        .eq("current_room", roomNum)
         .neq("session_id", SESSION_ID)
         .gt("last_seen", new Date(Date.now() - 45000).toISOString()); // active in last 45s
       const humans = (freshUsers || []).map(u => ({ id: u.session_id, name: u.user_name, color: u.rock_color, shapeIndex: u.rock_shape, accessory: u.rock_accessory, isBot: false }));
