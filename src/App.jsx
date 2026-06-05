@@ -258,10 +258,17 @@ export default function RockTalk() {
           accessory: p.rock_accessory || "none",
           isBot: false,
         })).filter(p => p.id !== SESSION_ID);
+
         setRoomRocks(prev => {
-          const bots = prev.filter(r => r.isBot);
+          // Keep existing bots, just update human list
+          const existingBots = prev.filter(r => r.isBot);
           const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
-          return [...humans, ...bots.slice(0, botCount)];
+          const bots = existingBots.slice(0, botCount);
+          // Only update if something actually changed
+          const existingHumanIds = prev.filter(r => !r.isBot).map(r => r.id).sort().join(",");
+          const newHumanIds = humans.map(r => r.id).sort().join(",");
+          if (existingHumanIds === newHumanIds && existingBots.length === bots.length) return prev;
+          return [...humans, ...bots];
         });
       })
       .on("presence", { event: "join" }, ({ newPresences }) => {
@@ -278,6 +285,14 @@ export default function RockTalk() {
         leftPresences.forEach(p => {
           if (p.session_id === SESSION_ID) return;
           setMessages(prev => [...prev, { id: Date.now(), rockId: "system", text: `${p.user_name} rolled away`, system: true }]);
+          // Remove their rock immediately
+          setRoomRocks(prev => {
+            const remaining = prev.filter(r => r.id !== p.session_id);
+            const humanCount = remaining.filter(r => !r.isBot).length;
+            const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humanCount - 1));
+            const bots = remaining.filter(r => r.isBot).slice(0, botCount);
+            return [...remaining.filter(r => !r.isBot), ...bots];
+          });
         });
       })
       .subscribe(async (status) => {
@@ -637,7 +652,7 @@ const globalStyles = `
 `;
 
 const styles = {
-  app: { minHeight:"100vh", background:"linear-gradient(160deg,#1a1410 0%,#1e1a14 50%,#141a18 100%)", fontFamily:"'DM Mono',monospace", color:"#e8ddd0", display:"flex", flexDirection:"column", maxWidth:480, margin:"0 auto", position:"relative", overflow:"hidden" },
+  app: { height:"100dvh", maxHeight:"100dvh", background:"linear-gradient(160deg,#1a1410 0%,#1e1a14 50%,#141a18 100%)", fontFamily:"'DM Mono',monospace", color:"#e8ddd0", display:"flex", flexDirection:"column", maxWidth:480, margin:"0 auto", position:"relative", overflow:"hidden" },
   centered: { flex:1, display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", padding:"24px 20px", overflowY:"auto" },
   bigTitle: { fontFamily:"'Fraunces',serif", fontSize:42, fontWeight:900, color:"#e8ddd0", letterSpacing:-1, textAlign:"center" },
   subtitle: { color:"#9a8f85", fontSize:13, textAlign:"center", marginTop:8, marginBottom:20, maxWidth:280, lineHeight:1.5 },
@@ -669,4 +684,3 @@ const styles = {
   inputRow: { display:"flex", gap:8, padding:"12px 16px", borderTop:"1px solid rgba(255,255,255,0.06)", flexShrink:0 },
   sendBtn: { background:"#8B7355", border:"none", borderRadius:10, width:44, height:44, fontSize:20, cursor:"pointer", flexShrink:0 },
 };
-
