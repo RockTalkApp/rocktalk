@@ -146,8 +146,8 @@ export default function RockTalk() {
   useEffect(() => { usernameRef.current = username; }, [username]);
   useEffect(() => { myRockRef.current = myRock; }, [myRock]);
 
-  const refreshRoomRocks = useCallback(async (rn) => {
-    const cutoff = new Date(Date.now() - 120000).toISOString(); // 2 min cutoff
+  const refreshRoomRocks = useCallback(async (rn, addOnly = true) => {
+    const cutoff = new Date(Date.now() - 120000).toISOString();
     const { data } = await supabase.from("users")
       .select("*")
       .eq("current_room", parseInt(rn))
@@ -164,15 +164,23 @@ export default function RockTalk() {
 
     setOtherRocks(prev => {
       const existingBots = prev.filter(r => r.isBot);
-      const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
-      const bots = existingBots.length < botCount
-        ? [...existingBots, ...Array.from({ length: botCount - existingBots.length }, (_, i) => makeBot((rn * 10 + existingBots.length + i) % (BOT_NAMES.length * 5)))]
-        : existingBots.slice(0, botCount);
-      // Only update if humans actually changed
-      const prevHumanIds = prev.filter(r => !r.isBot).map(r => r.id).sort().join(",");
-      const newHumanIds = humans.map(r => r.id).sort().join(",");
-      if (prevHumanIds === newHumanIds) return prev; // no change, keep existing
-      return [...humans, ...bots];
+      const existingHumans = prev.filter(r => !r.isBot);
+
+      if (addOnly) {
+        // Only ADD new humans, never remove existing ones
+        const existingIds = existingHumans.map(r => r.id);
+        const newHumans = humans.filter(h => !existingIds.includes(h.id));
+        if (newHumans.length === 0) return prev;
+        const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - existingHumans.length - newHumans.length - 1));
+        return [...existingHumans, ...newHumans, ...existingBots.slice(0, botCount)];
+      } else {
+        // Full replace — only used on initial load
+        const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
+        const bots = existingBots.length < botCount
+          ? [...existingBots, ...Array.from({ length: botCount - existingBots.length }, (_, i) => makeBot((rn * 10 + existingBots.length + i) % (BOT_NAMES.length * 5)))]
+          : existingBots.slice(0, botCount);
+        return [...humans, ...bots];
+      }
     });
   }, []);
 
@@ -203,14 +211,14 @@ export default function RockTalk() {
       last_seen: new Date().toISOString(),
     }, { onConflict: "session_id" });
 
-    // Load initial rocks - retry a few times to catch anyone already in room
-    await refreshRoomRocks(rn);
+    // Initial load — full replace to set up bots correctly
+    await refreshRoomRocks(rn, false);
 
     setMessages([{ id: "sys", rockId: "system", text: `You rolled into Room #${rn}. Bots are keeping you company...`, system: true }]);
 
-    // Retry refreshes to catch people already in room
+    // Retry refreshes — add-only so existing rocks never get removed
     [1000, 3000, 6000].forEach(delay => {
-      setTimeout(() => refreshRoomRocks(rn), delay);
+      setTimeout(() => refreshRoomRocks(rn, true), delay);
     });
 
     // Broadcast channel for messages only
@@ -234,7 +242,7 @@ export default function RockTalk() {
           if (prev.some(m => m.system && m.text?.includes(payload.name) && m.text?.includes("rolled in"))) return prev;
           return [...prev, { id: Date.now(), rockId: "system", text: `${payload.name} just rolled in 🪨`, system: true }];
         });
-        refreshRoomRocks(rn);
+        refreshRoomRocks(rn, true); // add-only
         // Reply with "here" event (not "join") so newcomer sees us without triggering join/leave cycle
         [500, 2000].forEach(delay => {
           setTimeout(() => {
