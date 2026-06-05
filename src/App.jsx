@@ -163,12 +163,15 @@ export default function RockTalk() {
     }));
 
     setOtherRocks(prev => {
+      const existingBots = prev.filter(r => r.isBot);
       const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
-      const existingBots = prev.filter(r => r.isBot).slice(0, botCount);
-      // Fill bots if needed
       const bots = existingBots.length < botCount
         ? [...existingBots, ...Array.from({ length: botCount - existingBots.length }, (_, i) => makeBot((rn * 10 + existingBots.length + i) % (BOT_NAMES.length * 5)))]
-        : existingBots;
+        : existingBots.slice(0, botCount);
+      // Only update if humans actually changed
+      const prevHumanIds = prev.filter(r => !r.isBot).map(r => r.id).sort().join(",");
+      const newHumanIds = humans.map(r => r.id).sort().join(",");
+      if (prevHumanIds === newHumanIds) return prev; // no change, keep existing
       return [...humans, ...bots];
     });
   }, []);
@@ -231,8 +234,13 @@ export default function RockTalk() {
       })
       .on("broadcast", { event: "leave" }, ({ payload }) => {
         if (payload.sid === SESSION_ID) return;
-        setMessages(prev => [...prev, { id: Date.now(), rockId: "system", text: `${payload.name} rolled away`, system: true }]);
-        refreshRoomRocks(rn);
+        setMessages(prev => {
+          // Deduplicate - don't show rolled away twice within 5 seconds
+          const recent = prev.filter(m => m.system && m.text?.includes(payload.name) && m.text?.includes("rolled away") && Date.now() - (m.ts || 0) < 5000);
+          if (recent.length > 0) return prev;
+          return [...prev, { id: Date.now(), rockId: "system", text: `${payload.name} rolled away`, system: true, ts: Date.now() }];
+        });
+        setOtherRocks(prev => prev.filter(r => r.id !== payload.sid));
       })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
@@ -282,10 +290,11 @@ export default function RockTalk() {
     const currentRoom = roomNumberRef.current;
     clearInterval(heartbeatRef.current);
     clearInterval(botTimerRef.current);
-    if (channelRef.current) {
-      await channelRef.current.send({ type: "broadcast", event: "leave", payload: { sid: SESSION_ID, name: usernameRef.current } });
-      supabase.removeChannel(channelRef.current);
-      channelRef.current = null;
+    const ch = channelRef.current;
+    channelRef.current = null; // clear ref first to prevent double sends
+    if (ch) {
+      await ch.send({ type: "broadcast", event: "leave", payload: { sid: SESSION_ID, name: usernameRef.current } });
+      supabase.removeChannel(ch);
     }
     if (currentRoom) {
       await supabase.from("users").update({ current_room: null }).eq("session_id", SESSION_ID);
@@ -314,15 +323,18 @@ export default function RockTalk() {
 
   useEffect(() => {
     if (screen !== "room") return;
-    const cleanup = async () => {
-      if (channelRef.current) {
-        await channelRef.current.send({ type: "broadcast", event: "leave", payload: { sid: SESSION_ID, name: usernameRef.current } });
-        supabase.removeChannel(channelRef.current);
+    // Use visibilitychange instead of beforeunload - more reliable on mobile
+    const handleVisibility = () => {
+      if (document.visibilityState === "hidden") {
+        // Tab hidden - update last_seen so heartbeat pauses gracefully
+        // Don't remove from room - they may come back
+        navigator.sendBeacon && navigator.sendBeacon("/api/ping"); // no-op, just keeps connection
       }
-      await supabase.from("users").update({ current_room: null }).eq("session_id", SESSION_ID);
     };
-    window.addEventListener("beforeunload", cleanup);
-    return () => { window.removeEventListener("beforeunload", cleanup); cleanup(); };
+    document.addEventListener("visibilitychange", handleVisibility);
+    return () => {
+      document.removeEventListener("visibilitychange", handleVisibility);
+    };
   }, [screen]);
 
   const sendMessage = async () => {
