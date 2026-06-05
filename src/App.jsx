@@ -253,25 +253,30 @@ export default function RockTalk() {
       })
       .on("presence", { event: "sync" }, () => {
         const state = channel.presenceState();
-        const humans = Object.values(state).flat().map(p => ({
+        const allPresent = Object.values(state).flat();
+        const humans = allPresent.map(p => ({
           id: p.session_id, name: p.user_name,
           color: p.rock_color || COLORS[0],
           shapeIndex: p.rock_shape || 0,
           accessory: p.rock_accessory || "none",
           isBot: false,
         })).filter(p => p.id !== SESSION_ID);
-        // Only update humans — never touch bots here
+
+        // Only update if we got a non-empty list OR if we can confirm room is genuinely empty
+        // Never wipe humans based on an empty sync (can happen during reconnect)
         setHumanRocksInRoom(prev => {
+          if (humans.length === 0 && prev.length > 0) return prev; // ignore empty syncs
           const prevIds = prev.map(r => r.id).sort().join(",");
           const newIds = humans.map(r => r.id).sort().join(",");
           if (prevIds === newIds) return prev;
           return humans;
         });
-        // Adjust bot count based on human count
-        setBotRocksInRoom(prev => {
-          const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
-          return prev.slice(0, botCount);
-        });
+        if (humans.length > 0) {
+          setBotRocksInRoom(prev => {
+            const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - humans.length - 1));
+            return prev.slice(0, botCount);
+          });
+        }
       })
       .on("presence", { event: "join" }, ({ newPresences }) => {
         newPresences.forEach(p => {
@@ -311,9 +316,25 @@ export default function RockTalk() {
     channelRef.current = channel;
 
     // Heartbeat — update last_seen every 30 seconds so cleanup knows we're alive
+    // Also re-fetch humans from DB as a fallback in case presence dropped someone
     clearInterval(heartbeatRef.current);
     heartbeatRef.current = setInterval(async () => {
       await supabase.from("users").update({ last_seen: new Date().toISOString() }).eq("session_id", SESSION_ID);
+      // Re-fetch current humans in room as fallback
+      const { data: freshUsers } = await supabase.from("users")
+        .select("*")
+        .eq("current_room", rn)
+        .neq("session_id", SESSION_ID)
+        .gt("last_seen", new Date(Date.now() - 90000).toISOString());
+      if (freshUsers && freshUsers.length > 0) {
+        const humans = freshUsers.map(u => ({ id: u.session_id, name: u.user_name, color: u.rock_color, shapeIndex: u.rock_shape, accessory: u.rock_accessory, isBot: false }));
+        setHumanRocksInRoom(prev => {
+          const prevIds = prev.map(r => r.id).sort().join(",");
+          const newIds = humans.map(r => r.id).sort().join(",");
+          if (prevIds === newIds) return prev;
+          return humans;
+        });
+      }
     }, 30000);
 
     // Cleanup stale users every 60 seconds
