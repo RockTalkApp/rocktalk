@@ -114,9 +114,6 @@ const BLOCKED_DOMAINS = [
   "onion","darkweb","grabify","iplogger","ipgrabber","stresser","booter",
 ];
 
-// Suspicious link patterns
-const LINK_PATTERN = /https?:\/\/[^\s]+|www\.[^\s]+|[^\s]+\.(com|net|org|io|co|app|xyz|ru|tk|ml|ga|cf|gq|top|club|site|online|fun|live)[^\s]*/gi;
-
 function hardBlock(text) {
   // Check slurs and harmful phrases
   const lower = text.toLowerCase().replace(/[^a-z0-9\s]/g, " ");
@@ -126,13 +123,14 @@ function hardBlock(text) {
     }
   }
 
-  // Check for any URLs — block all links for safety
-  const links = text.match(LINK_PATTERN);
-  if (links) {
-    // Allow if it looks like a rock-related or innocent mention without http
-    const hasHttp = links.some(l => l.startsWith("http"));
-    const hasBadDomain = links.some(l => BLOCKED_DOMAINS.some(d => l.toLowerCase().includes(d)));
-    if (hasHttp || hasBadDomain) {
+  // Block any text that looks like a URL or domain
+  // Catches: http://x.com, www.x.com, x.com, x.com/path, options-alerts.com/
+  const domainPattern = /(|\s|^)(https?:\/\/|www\.)?[\w-]+(\.[\w-]+)+(\/[\w\-./?%&=]*)?/gi;
+  const tlds = ["com","net","org","io","co","app","xyz","ru","tk","ml","ga","cf","gq","top","club","site","online","fun","live","gg","tv","me","info","biz","us","uk","ca","au"];
+  const matches = text.match(domainPattern) || [];
+  for (const match of matches) {
+    const m = match.trim().toLowerCase();
+    if (tlds.some(tld => m.includes("." + tld))) {
       return { allowed: false, reason: "links aren't allowed in Rock Talk — just rocks and words 🪨" };
     }
   }
@@ -176,17 +174,6 @@ const COLORS = ["#8B7355","#6B8E6B","#8E6B7A","#6B7A8E","#8E8E6B","#7A6B8E","#6B
 const COLOR_NAMES = ["Sandstone","Mossy","Rose Quartz","Slate Blue","Citrine","Amethyst","Aquamarine","Amber"];
 const ROOM_CAPACITY = 6;
 const SESSION_ID = getSessionId();
-
-// ─── Google Analytics ─────────────────────────────────────────────────────────
-const GA_ID = "G-7D0PRRDFGN";
-if (typeof window !== "undefined") {
-  const s = document.createElement("script");
-  s.async = true; s.src = `https://www.googletagmanager.com/gtag/js?id=${GA_ID}`;
-  document.head.appendChild(s);
-  window.dataLayer = window.dataLayer || [];
-  function gtag(){window.dataLayer.push(arguments);} window.gtag = gtag;
-  gtag("js", new Date()); gtag("config", GA_ID);
-}
 
 // ─── Main App ────────────────────────────────────────────────────────────────
 export default function RockTalk() {
@@ -682,3 +669,4 @@ const styles = {
   inputRow: { display:"flex", gap:8, padding:"12px 16px", borderTop:"1px solid rgba(255,255,255,0.06)", flexShrink:0 },
   sendBtn: { background:"#8B7355", border:"none", borderRadius:10, width:44, height:44, fontSize:20, cursor:"pointer", flexShrink:0 },
 };
+
