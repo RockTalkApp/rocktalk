@@ -113,9 +113,29 @@ function getSessionId() {
   return id;
 }
 
+// TEMP (testing only): allow ?room=1234 in the URL to force a specific room,
+// so multiple windows can be put in the same room to reproduce the presence bug.
+function getForcedRoom() {
+  const r = parseInt(new URLSearchParams(window.location.search).get("room"), 10);
+  return Number.isInteger(r) && r > 0 ? r : null;
+}
+
+// The join_or_create_room RPC can come back in several shapes depending on how it's
+// declared (scalar int, numeric string, [n], [{...}], {...}). Normalize any of them to a
+// positive integer room number, or null if it's unusable — so we never write NaN/NULL.
+function coerceRoomNumber(rnData) {
+  let v = rnData;
+  if (Array.isArray(v)) v = v[0];
+  if (v && typeof v === "object") v = Object.values(v)[0];
+  const n = parseInt(v, 10);
+  return Number.isInteger(n) && n > 0 ? n : null;
+}
+
 const COLORS = ["#8B7355","#6B8E6B","#8E6B7A","#6B7A8E","#8E8E6B","#7A6B8E","#6B8E8E","#8E7A6B"];
 const COLOR_NAMES = ["Sandstone","Mossy","Rose Quartz","Slate Blue","Citrine","Amethyst","Aquamarine","Amber"];
 const ROOM_CAPACITY = 6;
+const HEARTBEAT_MS = 10000;         // how often we refresh last_seen + reconcile the roster
+const PRESENCE_TIMEOUT_MS = 30000;  // a rock with no heartbeat for this long is treated as gone (~3 missed beats)
 const SESSION_ID = getSessionId();
 
 export default function RockTalk() {
@@ -136,6 +156,7 @@ export default function RockTalk() {
   const roomNumberRef = useRef(null);
   const usernameRef = useRef(null);
   const myRockRef = useRef(null);
+  const otherRocksRef = useRef([]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
   useEffect(() => { if (!blockedMsg) return; const t = setTimeout(() => setBlockedMsg(""), 3000); return () => clearTimeout(t); }, [blockedMsg]);
@@ -145,9 +166,10 @@ export default function RockTalk() {
   useEffect(() => { roomNumberRef.current = roomNumber; }, [roomNumber]);
   useEffect(() => { usernameRef.current = username; }, [username]);
   useEffect(() => { myRockRef.current = myRock; }, [myRock]);
+  useEffect(() => { otherRocksRef.current = otherRocks; }, [otherRocks]);
 
   const refreshRoomRocks = useCallback(async (rn, addOnly = true) => {
-    const cutoff = new Date(Date.now() - 120000).toISOString();
+    const cutoff = new Date(Date.now() - PRESENCE_TIMEOUT_MS).toISOString();
     const { data } = await supabase.from("users")
       .select("*")
       .eq("current_room", parseInt(rn))
@@ -189,13 +211,20 @@ export default function RockTalk() {
     clearInterval(botTimerRef.current);
     if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
 
-    // Get room
-    let rn;
-    if (forceRoom) {
-      rn = forceRoom;
-    } else {
-      const { data: rnData } = await supabase.rpc("join_or_create_room");
-      rn = parseInt(rnData);
+    // Get room — never let current_room end up NULL.
+    let rn = coerceRoomNumber(forceRoom);
+    if (!rn) {
+      for (let attempt = 0; attempt < 3 && !rn; attempt++) {
+        const { data: rnData, error } = await supabase.rpc("join_or_create_room");
+        if (error) console.warn("join_or_create_room failed:", error.message);
+        rn = coerceRoomNumber(rnData);
+      }
+      // Last resort: the RPC never gave us a usable room — create a fresh one so the
+      // user still lands somewhere with a valid (non-NULL) current_room.
+      if (!rn) {
+        rn = Math.floor(Math.random() * 9999) + 1;
+        await supabase.from("rooms").insert({ room_number: rn, human_count: 1 });
+      }
     }
     setRoomNumber(rn);
     roomNumberRef.current = rn;
@@ -288,40 +317,62 @@ export default function RockTalk() {
       });
     channelRef.current = channel;
 
-    // Heartbeat — update DB every 15s + refresh rocks
+    // Heartbeat — touch our own last_seen, then reconcile the roster against the DB:
+    // add anyone new AND drop anyone who stopped heart-beating (closed tab / lost
+    // connection) past PRESENCE_TIMEOUT_MS. This is what makes ghost rocks disappear.
     heartbeatRef.current = setInterval(async () => {
       const currentRoom = roomNumberRef.current;
       if (!currentRoom) return;
-      // Update own heartbeat
       await supabase.from("users").update({
         last_seen: new Date().toISOString(),
         current_room: parseInt(currentRoom),
       }).eq("session_id", SESSION_ID);
-      // Only ADD rocks from DB refresh, never remove (removal via leave broadcast only)
-      const cutoff = new Date(Date.now() - 120000).toISOString();
-      const { data } = await supabase.from("users")
+
+      const cutoff = new Date(Date.now() - PRESENCE_TIMEOUT_MS).toISOString();
+      const { data, error } = await supabase.from("users")
         .select("*")
         .eq("current_room", parseInt(currentRoom))
         .neq("session_id", SESSION_ID)
         .gt("last_seen", cutoff);
-      if (data && data.length > 0) {
-        const humans = data.map(u => ({
-          id: u.session_id, name: u.user_name,
-          color: u.rock_color || COLORS[0],
-          shapeIndex: parseInt(u.rock_shape) || 0,
-          accessory: u.rock_accessory || "none",
-          isBot: false,
-        }));
-        setOtherRocks(prev => {
-          const existingIds = prev.filter(r => !r.isBot).map(r => r.id);
-          const newRocks = humans.filter(h => !existingIds.includes(h.id));
-          if (newRocks.length === 0) return prev; // nothing to add
-          const bots = prev.filter(r => r.isBot);
-          const botCount = Math.max(0, Math.min(3, ROOM_CAPACITY - (existingIds.length + newRocks.length) - 1));
-          return [...prev.filter(r => !r.isBot), ...newRocks, ...bots.slice(0, botCount)];
+      if (error) return; // transient read failure — don't wipe/announce the whole roster
+      const humans = (data || []).map(u => ({
+        id: u.session_id, name: u.user_name,
+        color: u.rock_color || COLORS[0],
+        shapeIndex: parseInt(u.rock_shape) || 0,
+        accessory: u.rock_accessory || "none",
+        isBot: false,
+      }));
+      const presentIds = new Set(humans.map(h => h.id));
+
+      // Announce anyone who left (refresh / close / lost connection) the same way the
+      // "roll away" button does. The reconcile below removes them either way.
+      const departed = otherRocksRef.current.filter(r => !r.isBot && !presentIds.has(r.id));
+      if (departed.length > 0) {
+        setMessages(prevMsgs => {
+          const now = Date.now();
+          const fresh = departed.filter(d =>
+            !prevMsgs.some(m => m.system && m.text === `${d.name} rolled away` && now - (m.ts || 0) < 5000)
+          );
+          if (fresh.length === 0) return prevMsgs;
+          return [...prevMsgs, ...fresh.map(d => ({ id: `${now}-${d.id}`, rockId: "system", text: `${d.name} rolled away`, system: true, ts: now }))];
         });
       }
-    }, 15000);
+
+      setOtherRocks(prev => {
+        const prevHumans = prev.filter(r => !r.isBot);
+        const prevBots = prev.filter(r => r.isBot);
+        // keep present humans in their current order, append any new ones, drop the rest
+        const kept = prevHumans.filter(h => presentIds.has(h.id));
+        const keptIds = new Set(kept.map(h => h.id));
+        const added = humans.filter(h => !keptIds.has(h.id));
+        const nextHumans = [...kept, ...added];
+        const botCount = Math.max(0, Math.min(prevBots.length, ROOM_CAPACITY - nextHumans.length - 1));
+        const bots = prevBots.slice(0, botCount);
+        const noChange = added.length === 0 && kept.length === prevHumans.length && bots.length === prevBots.length;
+        if (noChange) return prev;
+        return [...nextHumans, ...bots];
+      });
+    }, HEARTBEAT_MS);
 
     // Bot chat timer — only when no humans present
     botTimerRef.current = setInterval(() => {
@@ -377,18 +428,18 @@ export default function RockTalk() {
 
   useEffect(() => {
     if (screen !== "room") return;
-    // Use visibilitychange instead of beforeunload - more reliable on mobile
-    const handleVisibility = () => {
-      if (document.visibilityState === "hidden") {
-        // Tab hidden - update last_seen so heartbeat pauses gracefully
-        // Don't remove from room - they may come back
-        navigator.sendBeacon && navigator.sendBeacon("/api/ping"); // no-op, just keeps connection
+    // Best-effort fast cleanup: when the tab is really closing/navigating away, tell the
+    // others we left so our rock vanishes immediately. (Sends during unload aren't
+    // guaranteed to flush — the heartbeat reconcile is the reliable fallback.)
+    const handlePageHide = (e) => {
+      if (e.persisted) return; // going into bfcache, page may be restored — don't "leave"
+      const ch = channelRef.current;
+      if (ch) {
+        try { ch.send({ type: "broadcast", event: "leave", payload: { sid: SESSION_ID, name: usernameRef.current } }); } catch { /* ignore */ }
       }
     };
-    document.addEventListener("visibilitychange", handleVisibility);
-    return () => {
-      document.removeEventListener("visibilitychange", handleVisibility);
-    };
+    window.addEventListener("pagehide", handlePageHide);
+    return () => window.removeEventListener("pagehide", handlePageHide);
   }, [screen]);
 
   const sendMessage = async () => {
@@ -410,7 +461,7 @@ export default function RockTalk() {
   if (screen === "customize") return (
     <CustomizeScreen username={username} rock={myRock} setRock={setMyRock} onEnter={async () => {
       setScreen("room");
-      await joinRoom(myRock, username);
+      await joinRoom(myRock, username, getForcedRoom());
     }} />
   );
 
@@ -481,8 +532,6 @@ function WelcomeScreen({ onNext }) {
     if (trimmed.length > 20) { setErr("max 20 characters"); return; }
     const check = hardBlock(trimmed);
     if (check && !check.allowed) { setErr(`🚫 ${check.reason}`); return; }
-    const check = hardBlock(trimmed);
-    if (!check.allowed) { setErr(`🚫 ${check.reason}`); return; }
     onNext(trimmed);
   };
   return (
