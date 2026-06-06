@@ -374,11 +374,9 @@ export default function RockTalk() {
       });
     }, HEARTBEAT_MS);
 
-    // Bot chat timer — only when no humans present
+    // Bot chat timer: bots keep the room lively even when humans are present
     botTimerRef.current = setInterval(() => {
       setOtherRocks(prev => {
-        const humans = prev.filter(r => !r.isBot);
-        if (humans.length > 0) return prev;
         const bots = prev.filter(r => r.isBot);
         if (!bots.length || Math.random() > 0.25) return prev;
         const bot = bots[Math.floor(Math.random() * bots.length)];
