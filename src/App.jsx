@@ -156,6 +156,7 @@ export default function RockTalk() {
   const roomNumberRef = useRef(null);
   const usernameRef = useRef(null);
   const myRockRef = useRef(null);
+  const otherRocksRef = useRef([]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
   useEffect(() => { if (!blockedMsg) return; const t = setTimeout(() => setBlockedMsg(""), 3000); return () => clearTimeout(t); }, [blockedMsg]);
@@ -165,6 +166,7 @@ export default function RockTalk() {
   useEffect(() => { roomNumberRef.current = roomNumber; }, [roomNumber]);
   useEffect(() => { usernameRef.current = username; }, [username]);
   useEffect(() => { myRockRef.current = myRock; }, [myRock]);
+  useEffect(() => { otherRocksRef.current = otherRocks; }, [otherRocks]);
 
   const refreshRoomRocks = useCallback(async (rn, addOnly = true) => {
     const cutoff = new Date(Date.now() - PRESENCE_TIMEOUT_MS).toISOString();
@@ -327,11 +329,12 @@ export default function RockTalk() {
       }).eq("session_id", SESSION_ID);
 
       const cutoff = new Date(Date.now() - PRESENCE_TIMEOUT_MS).toISOString();
-      const { data } = await supabase.from("users")
+      const { data, error } = await supabase.from("users")
         .select("*")
         .eq("current_room", parseInt(currentRoom))
         .neq("session_id", SESSION_ID)
         .gt("last_seen", cutoff);
+      if (error) return; // transient read failure — don't wipe/announce the whole roster
       const humans = (data || []).map(u => ({
         id: u.session_id, name: u.user_name,
         color: u.rock_color || COLORS[0],
@@ -340,6 +343,21 @@ export default function RockTalk() {
         isBot: false,
       }));
       const presentIds = new Set(humans.map(h => h.id));
+
+      // Announce anyone who left (refresh / close / lost connection) the same way the
+      // "roll away" button does. The reconcile below removes them either way.
+      const departed = otherRocksRef.current.filter(r => !r.isBot && !presentIds.has(r.id));
+      if (departed.length > 0) {
+        setMessages(prevMsgs => {
+          const now = Date.now();
+          const fresh = departed.filter(d =>
+            !prevMsgs.some(m => m.system && m.text === `${d.name} rolled away` && now - (m.ts || 0) < 5000)
+          );
+          if (fresh.length === 0) return prevMsgs;
+          return [...prevMsgs, ...fresh.map(d => ({ id: `${now}-${d.id}`, rockId: "system", text: `${d.name} rolled away`, system: true, ts: now }))];
+        });
+      }
+
       setOtherRocks(prev => {
         const prevHumans = prev.filter(r => !r.isBot);
         const prevBots = prev.filter(r => r.isBot);
