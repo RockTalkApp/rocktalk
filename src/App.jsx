@@ -615,7 +615,7 @@ const styles = {
   subtitle: { color:"#9a8f85", fontSize:13, textAlign:"center", marginTop:8, marginBottom:20, maxWidth:280, lineHeight:1.5 },
   card: { background:"rgba(255,255,255,0.04)", border:"1px solid rgba(255,255,255,0.08)", borderRadius:16, padding:20, width:"100%", maxWidth:360 },
   label: { display:"block", fontSize:11, color:"#9a8f85", textTransform:"uppercase", letterSpacing:1.5, marginBottom:8, marginTop:16 },
-  input: { width:"100%", background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)", borderRadius:10, padding:"12px 14px", color:"#e8ddd0", fontFamily:"'DM Mono',monospace", fontSize:14, outline:"none" },
+  input: { width:"100%", background:"rgba(255,255,255,0.06)", border:"1px solid rgba(255,255,255,0.12)", borderRadius:10, padding:"12px 14px", color:"#e8ddd0", fontFamily:"'DM Mono',monospace", fontSize:16, outline:"none" },
   err: { color:"#c0756a", fontSize:12, marginTop:6, lineHeight:1.4 },
   primaryBtn: { width:"100%", marginTop:16, background:"#8B7355", border:"none", borderRadius:10, padding:"13px", color:"#fff", fontFamily:"'DM Mono',monospace", fontSize:14, cursor:"pointer", letterSpacing:0.5 },
   colorRow: { display:"flex", flexWrap:"wrap", gap:8, marginBottom:4 },
