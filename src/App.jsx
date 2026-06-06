@@ -514,7 +514,7 @@ export default function RockTalk() {
       </div>
       {blockedMsg && <div style={styles.blockedBanner}>{blockedMsg}</div>}
       <div style={styles.inputRow}>
-        <input style={styles.input} value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && sendMessage()} placeholder="say something, rock..." maxLength={200} />
+        <input style={{ ...styles.input, flex: 1, minWidth: 0, width: "auto" }} value={input} onChange={e => setInput(e.target.value)} onKeyDown={e => e.key === "Enter" && sendMessage()} placeholder="say something, rock..." maxLength={200} />
         <button style={{ ...styles.sendBtn }} onClick={sendMessage}>🪨</button>
       </div>
     </div>
