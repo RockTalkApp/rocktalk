@@ -87,6 +87,31 @@ function makeBot(seed) {
   return { id: `bot_${seed}`, name: BOT_NAMES[i], color: BOT_COLORS[i % BOT_COLORS.length], shapeIndex: i % 4, accessory: Object.keys(ACCESSORIES)[i % Object.keys(ACCESSORIES).length], isBot: true };
 }
 
+// Deterministic PRNG: every client in a room generates the SAME bot chatter for a given
+// time-tick, so bot messages are identical for everyone (no per-user Math.random).
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// The stable set of bots a room can have (same on every client), using the same seed
+// formula as refreshRoomRocks. We pick from the full potential roster rather than the
+// currently-rendered bots, since bot count varies with human_count (which can drift).
+function botRosterForRoom(rn) {
+  return [0, 1, 2].map(i => makeBot((rn * 10 + i) % (BOT_NAMES.length * 5)));
+}
+
+// Map a tracked Realtime Presence payload to a human rock (same field defaults as the
+// broadcast msg/here handlers). Presence carries full appearance, unlike the join broadcast.
+function presenceToRock(p) {
+  return { id: p.sid, name: p.name, color: p.rock_color || COLORS[0], shapeIndex: parseInt(p.rock_shape) || 0, accessory: p.rock_accessory || "none", isBot: false };
+}
+
 // Hard content filter — instant, no API needed
 const HARD_BLOCKED = ["nigger","nigga","n1gger","faggot","chink","spic","kike","gook","wetback","coon","kill yourself","kys","lynch","hang yourself","retard"];
 const BLOCKED_DOMAINS = ["porn","xxx","sex","nude","onlyfans","adult","nsfw","malware","phishing"];
@@ -136,6 +161,7 @@ const COLOR_NAMES = ["Sandstone","Mossy","Rose Quartz","Slate Blue","Citrine","A
 const ROOM_CAPACITY = 6;
 const HEARTBEAT_MS = 10000;         // how often we refresh last_seen + reconcile the roster
 const PRESENCE_TIMEOUT_MS = 30000;  // a rock with no heartbeat for this long is treated as gone (~3 missed beats)
+const BOT_INTERVAL_MS = 9000;       // bot chatter is evaluated once per this time-tick
 const SESSION_ID = getSessionId();
 
 export default function RockTalk() {
@@ -153,10 +179,10 @@ export default function RockTalk() {
   const channelRef = useRef(null);
   const heartbeatRef = useRef(null);
   const botTimerRef = useRef(null);
+  const lastBotTickRef = useRef(-1); // last bot-chatter time-tick we evaluated (each tick fires once)
   const roomNumberRef = useRef(null);
   const usernameRef = useRef(null);
   const myRockRef = useRef(null);
-  const otherRocksRef = useRef([]);
 
   useEffect(() => { messagesEndRef.current?.scrollIntoView({ behavior: "smooth" }); }, [messages]);
   useEffect(() => { if (!blockedMsg) return; const t = setTimeout(() => setBlockedMsg(""), 3000); return () => clearTimeout(t); }, [blockedMsg]);
@@ -166,7 +192,6 @@ export default function RockTalk() {
   useEffect(() => { roomNumberRef.current = roomNumber; }, [roomNumber]);
   useEffect(() => { usernameRef.current = username; }, [username]);
   useEffect(() => { myRockRef.current = myRock; }, [myRock]);
-  useEffect(() => { otherRocksRef.current = otherRocks; }, [otherRocks]);
 
   const refreshRoomRocks = useCallback(async (rn, addOnly = true) => {
     const cutoff = new Date(Date.now() - PRESENCE_TIMEOUT_MS).toISOString();
@@ -209,6 +234,7 @@ export default function RockTalk() {
   const joinRoom = useCallback(async (rock, name, forceRoom = null) => {
     clearInterval(heartbeatRef.current);
     clearInterval(botTimerRef.current);
+    lastBotTickRef.current = -1;
     if (channelRef.current) { supabase.removeChannel(channelRef.current); channelRef.current = null; }
 
     // Get room — never let current_room end up NULL.
@@ -250,8 +276,8 @@ export default function RockTalk() {
       setTimeout(() => refreshRoomRocks(rn, true), delay);
     });
 
-    // Broadcast channel for messages only
-    const channel = supabase.channel(`room_${rn}`)
+    // Realtime channel: broadcast for chat + Presence for the live roster (who's in the room)
+    const channel = supabase.channel(`room_${rn}`, { config: { presence: { key: SESSION_ID } } })
       .on("broadcast", { event: "msg" }, ({ payload }) => {
         if (payload.sid === SESSION_ID) return;
         setMessages(prev => [...prev, { id: payload.id, rockId: payload.sid, rockName: payload.name, text: payload.text, timestamp: Date.now() }]);
@@ -301,8 +327,47 @@ export default function RockTalk() {
         });
         setOtherRocks(prev => prev.filter(r => r.id !== payload.sid));
       })
+      // Presence = the source of truth for who's in the room. Connection-level liveness, so a
+      // backgrounded tab (whose JS timers are throttled) stays present and is never falsely
+      // dropped; a real disconnect fires "leave" server-side.
+      .on("presence", { event: "sync" }, () => {
+        const state = channel.presenceState();
+        const present = Object.entries(state)
+          .filter(([key]) => key !== SESSION_ID)
+          .map(([, entries]) => entries[0])
+          .filter(Boolean)
+          .map(presenceToRock);
+        if (present.length === 0) return;
+        // Add-only: never remove here (avoids flicker from transient sync states); leave handles removals.
+        setOtherRocks(prev => {
+          const existingHumans = prev.filter(r => !r.isBot);
+          const existingIds = new Set(existingHumans.map(r => r.id));
+          const toAdd = present.filter(p => !existingIds.has(p.id));
+          if (toAdd.length === 0) return prev;
+          const existingBots = prev.filter(r => r.isBot);
+          const nextHumans = [...existingHumans, ...toAdd];
+          const botCount = Math.max(0, Math.min(existingBots.length, ROOM_CAPACITY - nextHumans.length - 1));
+          return [...nextHumans, ...existingBots.slice(0, botCount)];
+        });
+      })
+      .on("presence", { event: "leave" }, ({ leftPresences }) => {
+        const left = (leftPresences || []).filter(p => p && p.sid && p.sid !== SESSION_ID);
+        if (left.length === 0) return;
+        setMessages(prev => {
+          const now = Date.now();
+          const fresh = left.filter(p =>
+            !prev.some(m => m.system && m.text === `${p.name} rolled away` && now - (m.ts || 0) < 5000)
+          );
+          if (fresh.length === 0) return prev;
+          return [...prev, ...fresh.map(p => ({ id: `${now}-${p.sid}`, rockId: "system", text: `${p.name} rolled away`, system: true, ts: now }))];
+        });
+        const leftIds = new Set(left.map(p => p.sid));
+        setOtherRocks(prev => prev.filter(r => !leftIds.has(r.id)));
+      })
       .subscribe(async (status) => {
         if (status === "SUBSCRIBED") {
+          // Register in Presence so everyone's roster sees us (carries our full appearance).
+          await channel.track({ sid: SESSION_ID, name, rock_color: rock.color, rock_shape: rock.shapeIndex, rock_accessory: rock.accessory });
           // Announce immediately
           await channel.send({ type: "broadcast", event: "join", payload: { sid: SESSION_ID, name } });
           // Also refresh rocks from DB right away to catch anyone already here
@@ -317,9 +382,10 @@ export default function RockTalk() {
       });
     channelRef.current = channel;
 
-    // Heartbeat — touch our own last_seen, then reconcile the roster against the DB:
-    // add anyone new AND drop anyone who stopped heart-beating (closed tab / lost
-    // connection) past PRESENCE_TIMEOUT_MS. This is what makes ghost rocks disappear.
+    // Heartbeat — touch our own last_seen/current_room (used for cross-session discovery and
+    // room bookkeeping), then ADD-ONLY discovery of any humans we haven't rendered yet.
+    // Departures are NOT decided here anymore: Realtime Presence "leave" handles removals, so a
+    // backgrounded tab with a throttled timer can't trigger a false "rolled away".
     heartbeatRef.current = setInterval(async () => {
       const currentRoom = roomNumberRef.current;
       if (!currentRoom) return;
@@ -327,66 +393,29 @@ export default function RockTalk() {
         last_seen: new Date().toISOString(),
         current_room: parseInt(currentRoom),
       }).eq("session_id", SESSION_ID);
-
-      const cutoff = new Date(Date.now() - PRESENCE_TIMEOUT_MS).toISOString();
-      const { data, error } = await supabase.from("users")
-        .select("*")
-        .eq("current_room", parseInt(currentRoom))
-        .neq("session_id", SESSION_ID)
-        .gt("last_seen", cutoff);
-      if (error) return; // transient read failure — don't wipe/announce the whole roster
-      const humans = (data || []).map(u => ({
-        id: u.session_id, name: u.user_name,
-        color: u.rock_color || COLORS[0],
-        shapeIndex: parseInt(u.rock_shape) || 0,
-        accessory: u.rock_accessory || "none",
-        isBot: false,
-      }));
-      const presentIds = new Set(humans.map(h => h.id));
-
-      // Announce anyone who left (refresh / close / lost connection) the same way the
-      // "roll away" button does. The reconcile below removes them either way.
-      const departed = otherRocksRef.current.filter(r => !r.isBot && !presentIds.has(r.id));
-      if (departed.length > 0) {
-        setMessages(prevMsgs => {
-          const now = Date.now();
-          const fresh = departed.filter(d =>
-            !prevMsgs.some(m => m.system && m.text === `${d.name} rolled away` && now - (m.ts || 0) < 5000)
-          );
-          if (fresh.length === 0) return prevMsgs;
-          return [...prevMsgs, ...fresh.map(d => ({ id: `${now}-${d.id}`, rockId: "system", text: `${d.name} rolled away`, system: true, ts: now }))];
-        });
-      }
-
-      setOtherRocks(prev => {
-        const prevHumans = prev.filter(r => !r.isBot);
-        const prevBots = prev.filter(r => r.isBot);
-        // keep present humans in their current order, append any new ones, drop the rest
-        const kept = prevHumans.filter(h => presentIds.has(h.id));
-        const keptIds = new Set(kept.map(h => h.id));
-        const added = humans.filter(h => !keptIds.has(h.id));
-        const nextHumans = [...kept, ...added];
-        const botCount = Math.max(0, Math.min(prevBots.length, ROOM_CAPACITY - nextHumans.length - 1));
-        const bots = prevBots.slice(0, botCount);
-        const noChange = added.length === 0 && kept.length === prevHumans.length && bots.length === prevBots.length;
-        if (noChange) return prev;
-        return [...nextHumans, ...bots];
-      });
+      await refreshRoomRocks(currentRoom, true); // add-only; presence is the source of truth for who left
     }, HEARTBEAT_MS);
 
-    // Bot chat timer: bots keep the room lively even when humans are present
+    // Bot chat timer: deterministic so every client in the room shows the SAME bot
+    // messages at the same time-tick (was per-user Math.random => everyone out of sync).
     botTimerRef.current = setInterval(() => {
-      setOtherRocks(prev => {
-        const bots = prev.filter(r => r.isBot);
-        if (!bots.length || Math.random() > 0.25) return prev;
-        const bot = bots[Math.floor(Math.random() * bots.length)];
-        const line = BOT_LINES[Math.floor(Math.random() * BOT_LINES.length)];
-        setSpeakingId(bot.id);
-        setTimeout(() => setSpeakingId(null), 2500);
-        setMessages(m => [...m, { id: Date.now(), rockId: bot.id, rockName: bot.name, text: line, timestamp: Date.now() }]);
-        return prev;
-      });
-    }, 9000);
+      const currentRoom = roomNumberRef.current;
+      if (!currentRoom) return;
+      const tick = Math.floor(Date.now() / BOT_INTERVAL_MS);
+      if (tick === lastBotTickRef.current) return; // evaluate each tick once
+      lastBotTickRef.current = tick;
+      const rand = mulberry32((currentRoom * 1000003 + tick) >>> 0); // same seed on every client
+      if (rand() > 0.25) return;                                     // 25% chance, identical everywhere
+      const roster = botRosterForRoom(currentRoom);
+      const bot = roster[Math.floor(rand() * roster.length)];
+      const line = BOT_LINES[Math.floor(rand() * BOT_LINES.length)];
+      setSpeakingId(bot.id);
+      setTimeout(() => setSpeakingId(null), 2500);
+      const id = `bot-${currentRoom}-${tick}`;                       // deterministic id => natural de-dupe
+      setMessages(m => m.some(x => x.id === id)
+        ? m
+        : [...m, { id, rockId: bot.id, rockName: bot.name, text: line, timestamp: tick * BOT_INTERVAL_MS }]);
+    }, 1000); // poll each second; act once per 9s tick so ticks fire promptly despite drift
   }, [refreshRoomRocks]);
 
   const leaveRoom = async () => {
