@@ -337,17 +337,21 @@ export default function RockTalk() {
           .map(([, entries]) => entries[0])
           .filter(Boolean)
           .map(presenceToRock);
-        if (present.length === 0) return;
-        // Add-only: never remove here (avoids flicker from transient sync states); leave handles removals.
+        // Presence is authoritative: the human roster is exactly who is currently tracked here.
+        // Adds newcomers AND drops anyone who left (incl. ghosts re-added from stale DB rows).
         setOtherRocks(prev => {
-          const existingHumans = prev.filter(r => !r.isBot);
-          const existingIds = new Set(existingHumans.map(r => r.id));
-          const toAdd = present.filter(p => !existingIds.has(p.id));
-          if (toAdd.length === 0) return prev;
-          const existingBots = prev.filter(r => r.isBot);
-          const nextHumans = [...existingHumans, ...toAdd];
-          const botCount = Math.max(0, Math.min(existingBots.length, ROOM_CAPACITY - nextHumans.length - 1));
-          return [...nextHumans, ...existingBots.slice(0, botCount)];
+          const prevHumans = prev.filter(r => !r.isBot);
+          const prevBots = prev.filter(r => r.isBot);
+          const presentIds = new Set(present.map(p => p.id));
+          const kept = prevHumans.filter(h => presentIds.has(h.id)); // preserve order/identity
+          const keptIds = new Set(kept.map(h => h.id));
+          const added = present.filter(p => !keptIds.has(p.id));
+          const nextHumans = [...kept, ...added];
+          const botCount = Math.max(0, Math.min(prevBots.length, ROOM_CAPACITY - nextHumans.length - 1));
+          const bots = prevBots.slice(0, botCount);
+          const sameHumans = nextHumans.length === prevHumans.length && nextHumans.every((h, i) => prevHumans[i]?.id === h.id);
+          if (sameHumans && bots.length === prevBots.length) return prev;
+          return [...nextHumans, ...bots];
         });
       })
       .on("presence", { event: "leave" }, ({ leftPresences }) => {
@@ -382,10 +386,10 @@ export default function RockTalk() {
       });
     channelRef.current = channel;
 
-    // Heartbeat — touch our own last_seen/current_room (used for cross-session discovery and
-    // room bookkeeping), then ADD-ONLY discovery of any humans we haven't rendered yet.
-    // Departures are NOT decided here anymore: Realtime Presence "leave" handles removals, so a
-    // backgrounded tab with a throttled timer can't trigger a false "rolled away".
+    // Heartbeat — only touch our own last_seen/current_room (room bookkeeping). The in-room
+    // roster is owned entirely by Realtime Presence (sync/leave); the heartbeat must NOT add or
+    // remove rocks. A stale DB row from an unclean close lingers ~30s, so re-reading it here
+    // would resurrect a ghost that presence already removed.
     heartbeatRef.current = setInterval(async () => {
       const currentRoom = roomNumberRef.current;
       if (!currentRoom) return;
@@ -393,7 +397,6 @@ export default function RockTalk() {
         last_seen: new Date().toISOString(),
         current_room: parseInt(currentRoom),
       }).eq("session_id", SESSION_ID);
-      await refreshRoomRocks(currentRoom, true); // add-only; presence is the source of truth for who left
     }, HEARTBEAT_MS);
 
     // Bot chat timer: deterministic so every client in the room shows the SAME bot
